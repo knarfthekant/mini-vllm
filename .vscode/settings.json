@@ -1,0 +1,6 @@
+{
+    "search.useIgnoreFiles": false,
+    "search.searchView.semanticSearchBehavior": "runOnEmpty",
+    "search.searchView.keywordSuggestions": false,
+    "search.smartCase": true
+}
