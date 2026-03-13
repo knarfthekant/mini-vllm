@@ -61,7 +61,7 @@ class Request:
     def __init__(
         self,
         prompt_token_ids: List[int],
-        sampling_params: SamplingParams = None,
+        sampling_params: SamplingParams | None = None,
         request_id: Optional[str] = None,
         arrival_time: Optional[float] = None,
     ) -> None:
