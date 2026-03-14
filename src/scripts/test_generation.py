@@ -48,9 +48,7 @@ DEFAULT_PROMPTS = [
 # Short prompts
 SHORT_PROMPTS = ["Hello who are you", "1 + 1 =", "What is the capital of France?"]
 
-DEFAULT_MAX_TOKENS = 64
-# max_num_seqs=1: Llama-3.1-8B bf16 (~14.9 GB) nearly fills a 16 GB GPU.
-# Raise to 2-4 on GPUs with 24 GB+ VRAM.
+DEFAULT_MAX_TOKENS = 1028
 DEFAULT_MAX_NUM_SEQS = 2
 
 
