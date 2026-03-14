@@ -4,7 +4,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../litgpt"))
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -45,6 +45,10 @@ class GPUModelRunner:
         self.vllm_config = vllm_config
         self._model: GPT | None = None
         self._device: torch.device | None = None
+        # Free GPU bytes recorded immediately before model weights are loaded.
+        # Used by determine_available_memory() to measure the real memory delta
+        # caused by loading the model and running a warm-up forward pass.
+        self._init_gpu_free_bytes: int = 0
 
     @property
     def model(self) -> GPT:
@@ -66,50 +70,69 @@ class GPUModelRunner:
         """
         Instantiate GPT from checkpoint config and load weights.
 
-        Memory-efficient strategy to avoid OOM on 16 GB GPUs:
+        Loading strategy — minimal CPU RAM, correct dtype, single VRAM copy:
 
-          1. Build the model on the ``meta`` device — zero bytes, just structure.
-          2. Open the checkpoint with ``mmap=True`` so only the pages currently
-             being read are faulted into RAM rather than the full 16 GB at once.
-          3. ``to_empty(device)`` allocates uninitialised tensors on the GPU.
-          4. ``load_state_dict(assign=True)`` moves weights directly from the
-             memory-mapped CPU buffer onto the GPU, preserving the checkpoint
-             dtype (bfloat16).  No intermediate fp32 copy is created.
+          1. ``torch.load(map_location=device)`` streams each tensor directly
+             from disk → GPU through a small I/O buffer.  CPU RAM stays near
+             zero throughout (one tensor worth of read buffer at a time).
+             The previous mmap=True + map_location="cpu" approach faulted all
+             ~15 GiB of pages into RAM during load_state_dict, OOM-ing WSL2.
 
-        Without this approach the naïve flow (GPT(config) → .to(device)) creates
-        a full fp32 copy on CPU (~30 GB) before the GPU move, which OOMs on
-        machines where GPU VRAM ≈ model size.
+          2. The checkpoint dtype (bfloat16) is read from the first tensor so
+             the meta model can be cast before assign.  Without this the meta
+             model defaults to float32, doubling VRAM usage (~15 GiB → ~30 GiB)
+             and leaving no room for the KV cache.
+
+          3. ``load_state_dict(assign=True)`` wires the already-GPU tensors
+             directly into model parameters — no second VRAM copy, and no
+             ``to_empty()`` pre-allocation is needed.
         """
         checkpoint_dir = Path(self.vllm_config.checkpoint_dir)
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Snapshot free GPU memory before any model tensors are allocated.
+        # determine_available_memory() computes the delta against this value to
+        # find how much memory the model (+ warm-up activations) consumed.
+        if self._device.type == "cuda":
+            self._init_gpu_free_bytes = torch.cuda.mem_get_info()[0]
+
         config = Config.from_file(checkpoint_dir / "model_config.yaml")
-
-        # Step 1 — model structure on meta device: 0 bytes allocated
-        with torch.device("meta"):
-            self._model = GPT(config)
-        self.model.eval()
-
-        # Step 2 — allocate empty (uninitialised) tensors on the target device.
-        #           Parameters land on GPU but hold garbage — filled in step 4.
-        self.model.to_empty(device=self.device)
-
-        # Step 3 — memory-map the .pth file; pages are faulted in on demand
         checkpoint_path = checkpoint_dir / "lit_model.pth"
+
+        # Step 1 — stream weights from disk directly onto the target device.
+        #           CPU RAM usage stays near zero: PyTorch reads one tensor at
+        #           a time through an internal I/O buffer, then frees it.
         state_dict = torch.load(
             checkpoint_path,
-            map_location="cpu",
-            mmap=True,           # stream weights from disk rather than loading all at once
-            weights_only=False,  # litgpt uses custom storage objects
+            map_location=self.device,
+            weights_only=False,  # litgpt checkpoints may contain metadata objects
         )
         state_dict = state_dict.get("model", state_dict)
 
-        # Step 4 — copy weights from the mmap CPU buffer into the GPU tensors.
-        #           Without assign=True, load_state_dict copies each tensor from
-        #           the CPU mmap into the existing GPU parameters from step 2.
-        #           (assign=True would *replace* them with CPU tensors, leaving
-        #           the model on CPU — which is the bug we are fixing.)
-        self.model.load_state_dict(state_dict, strict=True)
+        # Step 2 — build model structure on the meta device (0 bytes), then
+        #           cast to the checkpoint dtype so that assign in step 3 does
+        #           not silently upcast bf16 weights to fp32.
+        checkpoint_dtype = next(iter(state_dict.values())).dtype
+        with torch.device("meta"):
+            self._model = GPT(config)
+        self.model.to(dtype=checkpoint_dtype)
+        self.model.eval()
+
+        # Step 3 — assign the already-loaded GPU tensors to the model.
+        #           assign=True replaces each meta parameter in-place; no second
+        #           VRAM allocation and no to_empty() pre-allocation needed.
+        self.model.load_state_dict(state_dict, strict=True, assign=True)
+
+        # Step 4 — rebuild non-persistent RoPE buffers (cos/sin) on the real
+        #           device.  GPT.__init__ calls the max_seq_length setter while
+        #           inside `with torch.device("meta")`, registering cos/sin as
+        #           meta-device tensors.  They are persistent=False so they are
+        #           not saved in the checkpoint and assign=True never replaces
+        #           them.  Without this step, forward() crashes with:
+        #             "Tensor on device meta is not on the expected device cuda"
+        cos, sin = self.model.rope_cache(device=self.device)
+        self.model.register_buffer("cos", cos, persistent=False)
+        self.model.register_buffer("sin", sin, persistent=False)
 
         dtype = next(self.model.parameters()).dtype
         logger.info("Model loaded on %s in %s", self.device, dtype)
@@ -120,8 +143,9 @@ class GPUModelRunner:
 
     def profile_run(self) -> None:
         """
-        Run a single dummy forward pass to warm up CUDA kernels and stabilise
-        GPU memory allocations before reading memory stats.
+        Run a single dummy forward pass to warm up CUDA kernels and let all
+        persistent allocations (model weights, CUDA graphs, etc.) settle before
+        the memory snapshot in ``determine_available_memory`` is taken.
 
         Uses batch_size=1 and BLOCK_SIZE tokens to keep the profile cheap
         while still triggering all kernel paths.
@@ -131,48 +155,53 @@ class GPUModelRunner:
             self.model(dummy)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
 
     def determine_available_memory(self) -> int:
         """
-        Profile the model and return the number of bytes available for KV
-        cache allocation.
+        Return the number of bytes available for KV cache allocation.
 
-        Follows nano-vllm's approach:
-          available = total * gpu_memory_utilization
-                      - used          (current physical allocation)
-                      - peak          (peak PyTorch allocation during forward)
-                      + current       (PyTorch current allocation; freed after forward)
+        Follows the same approach as vLLM and nano-vllm:
 
-        The ``peak - current`` delta captures activation memory at the worst
-        point of a forward pass.  On CPU, a conservative fixed budget is
-        returned so the logic path remains exercisable without a GPU.
+          1. ``_init_gpu_free_bytes`` is recorded in ``load_model()`` *before*
+             any model tensors are placed on the GPU.
+          2. A warm-up forward pass (``profile_run``) is executed so that all
+             persistent CUDA allocations have been made.
+          3. ``torch.cuda.empty_cache()`` returns unused cached blocks to the
+             CUDA driver so that ``mem_get_info`` reflects real free memory.
+          4. ``peak_used = _init_gpu_free_bytes - current_free`` is the physical
+             memory consumed by the model weights, CUDA context, and the worst-
+             case activation footprint of a single forward pass.
+          5. ``available = total * gpu_memory_utilization - peak_used``
+
+        This approach relies only on the CUDA driver's view of free/total memory
+        and avoids PyTorch's caching-allocator internals (``memory_stats`` peak
+        vs current), which are unreliable as an "available for KV cache" proxy.
         """
         self.profile_run()
 
         if self.device.type != "cuda":
-            # CPU fallback: allocate enough for the full context window.
             return _CPU_FALLBACK_MEMORY_BYTES
 
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        stats = torch.cuda.memory_stats()
-        peak = stats["allocated_bytes.all.peak"]
-        current = stats["allocated_bytes.all.current"]
+        # Release PyTorch's cached-but-idle blocks so the CUDA driver reports
+        # them as free in the mem_get_info call below.
+        torch.cuda.empty_cache()
 
-        available = int(
-            total * self.vllm_config.gpu_memory_utilization
-            - used
-            - peak
-            + current
-        )
+        free, total = torch.cuda.mem_get_info()
+
+        # Memory physically consumed since before load_model() was called.
+        # Includes: model weights + CUDA context + warm-up activation residue.
+        peak_used = self._init_gpu_free_bytes - free
+
+        available = int(total * self.vllm_config.gpu_memory_utilization - peak_used)
         available = max(0, available)
+
         logger.info(
-            "Memory profiling: total=%.1f GiB, used=%.1f GiB, "
-            "peak=%.1f GiB, available_for_kv=%.1f GiB",
+            "Memory profiling: total=%.1f GiB, before_load_free=%.1f GiB, "
+            "now_free=%.1f GiB, peak_used=%.1f GiB, available_for_kv=%.1f GiB",
             total / _GiB,
-            used / _GiB,
-            peak / _GiB,
+            self._init_gpu_free_bytes / _GiB,
+            free / _GiB,
+            peak_used / _GiB,
             available / _GiB,
         )
         return available
@@ -209,13 +238,16 @@ class GPUModelRunner:
             max_seq_length: Maximum per-sequence context the cache supports.
         """
         cfg = self.model.config
-        dtype_bytes: int = self.model.transformer.wte.weight.element_size()
+        dtype_bytes: int = self.model.transformer.wte.weight.element_size() # type: ignore[attr-defined]
         max_num_seqs: int = self.vllm_config.max_num_seqs
 
         # rope_cache_length: number of rotary elements in K's last dimension.
-        rope_cache_length: int = self.model.rope_cache_length()
+        rope_cache_length: int = self.model.rope_cache_length() # type: ignore[attr-defined]
         # K last-dim width (see litgpt build_kv_cache)
-        k_head_dim: int = rope_cache_length + cfg.head_size - cfg.rope_n_elem
+        assert cfg.head_size is not None, "Config.head_size must be set after __post_init__"
+        assert cfg.n_query_groups is not None, "Config.n_query_groups must be set after __post_init__"
+        rope_n_elem: int = int(cfg.rope_n_elem) # type: ignore[attr-defined]
+        k_head_dim: int = rope_cache_length + cfg.head_size - rope_n_elem
 
         # Bytes consumed per token position across the whole batch:
         #   2 sides (K/V) × layers × batch × query-groups × head-dim
@@ -227,7 +259,19 @@ class GPUModelRunner:
         if bytes_per_token == 0:
             raise RuntimeError("bytes_per_token is zero; model config may be invalid")
 
-        max_seq_length: int = available_bytes // bytes_per_token
+        # Reserve a fraction of available bytes for activation memory during
+        # prefill (nano-vllm / vLLM style).  Using 100% for KV leaves no headroom
+        # and causes OOM or extreme slowness when allocating 50K+ token caches.
+        kv_cache_fraction: float = 0.9
+        bytes_for_kv: int = int(available_bytes * kv_cache_fraction)
+
+        # This is the maximum sequence length that can be supported by the available memory.
+        max_seq_length: int = bytes_for_kv // bytes_per_token
+
+        # Cap at user-configurable max (keeps init and prefill fast)
+        if self.vllm_config.max_model_len is not None:
+            max_seq_length = min(max_seq_length, self.vllm_config.max_model_len)
+
         # Respect the model's own context window
         max_seq_length = min(max_seq_length, cfg.block_size)
         # Round down to BLOCK_SIZE boundary (≥ 1 block)
@@ -235,19 +279,21 @@ class GPUModelRunner:
 
         num_gpu_blocks: int = max_seq_length // BLOCK_SIZE
 
+        kv_cache_gib = (max_seq_length * bytes_per_token) / _GiB
         logger.info(
             "KV cache sizing: %d blocks × %d tokens/block = %d max_seq_length "
-            "(batch_size=%d, %.1f GiB)",
+            "(batch_size=%d, %.2f GiB)",
             num_gpu_blocks,
             BLOCK_SIZE,
             max_seq_length,
             max_num_seqs,
-            num_gpu_blocks * BLOCK_SIZE * bytes_per_token / max_seq_length / _GiB,
+            kv_cache_gib,
         )
         return num_gpu_blocks, max_seq_length
 
     def initialize_kv_cache(self, num_gpu_blocks: int, max_seq_length: int) -> None:
         """
+        TODO: Implement paged attention support in the future.
         Allocate litgpt's static KV-cache buffers and bind them to the model.
 
         Calls ``GPT.set_kv_cache(batch_size, max_seq_length)`` which

@@ -45,14 +45,13 @@ DEFAULT_PROMPTS = [
     "The capital of France is",
     "def fibonacci(n):",
 ]
-# Short prompts for GPUs where the model fills available VRAM and only a
-# minimal KV cache (< 32 tokens) can be allocated.
-SHORT_PROMPTS = ["Hello", "1 + 1 ="]
+# Short prompts
+SHORT_PROMPTS = ["Hello who are you", "1 + 1 =", "What is the capital of France?"]
 
 DEFAULT_MAX_TOKENS = 64
 # max_num_seqs=1: Llama-3.1-8B bf16 (~14.9 GB) nearly fills a 16 GB GPU.
 # Raise to 2-4 on GPUs with 24 GB+ VRAM.
-DEFAULT_MAX_NUM_SEQS = 1
+DEFAULT_MAX_NUM_SEQS = 2
 
 
 # --------------------------------------------------------------------------

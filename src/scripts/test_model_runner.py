@@ -46,7 +46,7 @@ CHECKPOINT_DIR = Path(ROOT) / "checkpoints/meta-llama/Meta-Llama-3.1-8B-Instruct
 # Increase to 2–4 on GPUs with 24 GB+ VRAM.
 VLLM_CONFIG = VllmConfig(
     checkpoint_dir=CHECKPOINT_DIR,
-    max_num_seqs=1,
+    max_num_seqs=2,
     gpu_memory_utilization=0.9,
 )
 

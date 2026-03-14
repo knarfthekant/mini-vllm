@@ -1,3 +1,6 @@
+"""
+Configuration for mini-vllm.
+"""
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +23,12 @@ class VllmConfig:
     max_num_seqs: int = 256
     """Maximum number of sequences that can run concurrently.
     Determines the batch_size dimension of litgpt's static KV cache."""
+
+    max_model_len: Optional[int] = 8192
+    """Maximum sequence length (context + generated) per request.
+    Caps KV cache allocation so init and prefill stay fast and activation
+    memory has headroom. None = use full computed length from VRAM (can be
+    slow and risk OOM on prefill). Typical: 4096, 8192, 16384."""
 
     gpu_memory_utilization: float = 0.9
     """Fraction of total GPU memory reserved for the engine (weights + KV cache).
