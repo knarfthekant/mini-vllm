@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Unit tests for GPUModelRunner lifecycle.
+Unit tests for ModelRunner lifecycle.
 
 Tests (run in order, each building on the last):
   1. model_load        – weights load; model is on the right device in eval mode
   2. kv_cache_memory   – determine_available_memory() returns a sane value
-  3. kv_cache_sizing   – compute_num_gpu_blocks() produces valid (num_blocks, max_seq_len)
+  3. kv_cache_sizing   – plan_kv_cache() produces a valid KV-cache plan
   4. kv_cache_init     – initialize_kv_cache() allocates K/V buffers with correct shapes
   5. execute_model     – a single prefill forward pass returns the right output type/shape
   6. kv_cache_shapes   – K/V tensors on every attention block match expected geometry
@@ -32,7 +32,7 @@ import torch
 from typing import Any
 
 from src.config.vllm import BLOCK_SIZE, VllmConfig
-from src.worker.model_runner import GPUModelRunner
+from src.worker.model_runner import ModelRunner
 from src.worker.model_input import SchedulerOutput
 
 # --------------------------------------------------------------------------
@@ -74,15 +74,15 @@ def run(name: str, fn):
 # --------------------------------------------------------------------------
 # Shared runner (loaded once, reused across tests)
 # --------------------------------------------------------------------------
-_runner: GPUModelRunner | None = None
+_runner: ModelRunner | None = None
 _num_blocks: int = 0
 _max_seq_length: int = 0
 
 
-def _get_runner() -> GPUModelRunner:
+def _get_runner() -> ModelRunner:
     global _runner
     if _runner is None:
-        _runner = GPUModelRunner(VLLM_CONFIG)
+        _runner = ModelRunner(VLLM_CONFIG)
     return _runner
 
 
@@ -131,8 +131,9 @@ def test_kv_cache_sizing():
     global _num_blocks, _max_seq_length
     runner = _get_runner()
 
-    available = runner.determine_available_memory()
-    num_blocks, max_seq_length = runner.compute_num_gpu_blocks(available)
+    plan = runner.plan_kv_cache()
+    num_blocks = plan.num_gpu_blocks
+    max_seq_length = plan.max_seq_length
 
     assert num_blocks >= 1, f"num_gpu_blocks={num_blocks} < 1"
     assert max_seq_length >= BLOCK_SIZE, (
@@ -155,7 +156,7 @@ def test_kv_cache_init():
     runner = _get_runner()
     assert _max_seq_length > 0, "run test_kv_cache_sizing first"
 
-    runner.initialize_kv_cache(_num_blocks, _max_seq_length)
+    runner.initialize_kv_cache()
 
     # Verify every transformer block has a KV cache with the right shapes
     cfg = runner.model.config
@@ -291,7 +292,7 @@ def test_batch_execute_model():
 
 def main():
     print(f"\n{'='*60}")
-    print(f"  GPUModelRunner tests — {CHECKPOINT_DIR.name}")
+    print(f"  ModelRunner tests — {CHECKPOINT_DIR.name}")
     print(f"  BLOCK_SIZE={BLOCK_SIZE}, max_num_seqs={VLLM_CONFIG.max_num_seqs}")
     print(f"{'='*60}\n")
 

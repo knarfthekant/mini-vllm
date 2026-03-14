@@ -11,12 +11,15 @@ class SchedulerOutput:
     and their positions for request i.  Variable-length sequences are supported;
     the ModelRunner pads them to a uniform (B, T) tensor internally.
 
-    When paged attention is added, block_tables and slot_mappings will be added
-    here so the ModelRunner can build attn_metadata.
+    ``block_tables`` and ``slot_mappings`` are optional today. Standard
+    attention ignores them; paged attention will consume them once the paged
+    execution path is wired into the model.
     """
 
     input_ids: List[List[int]] = field(default_factory=list)
     positions: List[List[int]] = field(default_factory=list)
+    block_tables: List[List[int]] = field(default_factory=list)
+    slot_mappings: List[List[int]] = field(default_factory=list)
 
 
 @dataclass

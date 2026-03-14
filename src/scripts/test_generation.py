@@ -3,7 +3,7 @@
 End-to-end generation test.
 
 Exercises the full stack:
-  AsyncEngine → UniProcExecutor → GPUModelRunner → litgpt GPT
+  AsyncEngine → ModelRunner → litgpt GPT
 
 Runs prefill + decode for each prompt using the Llama 3.1 tokenizer.
 Prompts are processed one at a time (batch_size=1 per KV cache reset) so
@@ -31,7 +31,6 @@ import torch
 
 from src.config.vllm import VllmConfig
 from src.engine.async_engine import AsyncEngine
-from src.executor.uniproc_executor import UniProcExecutor
 from src.worker.model_input import SchedulerOutput
 
 from litgpt.tokenizer import Tokenizer  # type: ignore[import-untyped]
@@ -167,7 +166,7 @@ def main() -> int:
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=0.9,
     )
-    engine = AsyncEngine(config, UniProcExecutor)
+    engine = AsyncEngine(config)
     t_init = time.perf_counter() - t0
     print(f"      done in {t_init:.1f}s  "
           f"(num_gpu_blocks={engine.num_gpu_blocks}, "
@@ -186,9 +185,12 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n[3/3] Generating...")
 
-    assert isinstance(engine.model_executor, UniProcExecutor)
-    model_runner = engine.model_executor.model_runner
+    model_runner = engine.model_runner
     max_seq_length = engine.max_seq_length
+    if model_runner.attention_backend_name != "standard":
+        raise NotImplementedError(
+            "test_generation.py currently exercises the standard attention path only."
+        )
 
     formatted = [_build_llama3_prompt(p) if not args.no_chat_template else p
                  for p in prompts]

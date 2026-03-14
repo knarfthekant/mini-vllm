@@ -2,7 +2,7 @@
 Configuration for mini-vllm.
 """
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
@@ -10,6 +10,7 @@ from pydantic.dataclasses import dataclass
 # Number of tokens per KV-cache block.  Matches nano-vllm; used by Request's
 # block helpers and the KV-cache size computation.
 BLOCK_SIZE: int = 16
+BaseCacheManager = Literal["standard", "paged"]
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
@@ -20,15 +21,21 @@ class VllmConfig:
     """Path to the litgpt model checkpoint directory
     (containing lit_model.pth and model_config.yaml)."""
 
+    max_num_batched_tokens: int = 16384
+    """Total number of tokens (summed across all sequences) that can be batched together."""
+
     max_num_seqs: int = 256
-    """Maximum number of sequences that can run concurrently.
-    Determines the batch_size dimension of litgpt's static KV cache."""
+    """Maximum number of sequences that can run concurrently."""
 
     max_model_len: Optional[int] = 8192
     """Maximum sequence length (context + generated) per request.
-    Caps KV cache allocation so init and prefill stay fast and activation
-    memory has headroom. None = use full computed length from VRAM (can be
+    Caps KV cache allocation. None = use full computed length from VRAM (can be
     slow and risk OOM on prefill). Typical: 4096, 8192, 16384."""
+
+    kv_cache_manager: BaseCacheManager = "standard"
+    """KV-cache manager used by the ModelRunner.
+    ``standard`` pre-allocates dense per-sequence KV tensors.
+    ``paged`` allocates a shared block pool for paged KV cache."""
 
     gpu_memory_utilization: float = 0.9
     """Fraction of total GPU memory reserved for the engine (weights + KV cache).
