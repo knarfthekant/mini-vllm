@@ -1,11 +1,15 @@
 """
 Configuration for mini-vllm.
 """
+from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
+
+if TYPE_CHECKING:
+    from litgpt.config import Config
 
 # Number of tokens per KV-cache block.  Matches nano-vllm; used by Request's
 # block helpers and the KV-cache size computation.
@@ -40,3 +44,10 @@ class VllmConfig:
     gpu_memory_utilization: float = 0.9
     """Fraction of total GPU memory reserved for the engine (weights + KV cache).
     Values in (0, 1]. Lower values leave headroom for other GPU workloads."""
+
+    @cached_property
+    def model_config(self) -> "Config":
+        """LitGPT model config loaded from checkpoint_dir/model_config.yaml."""
+        from litgpt.config import Config
+
+        return Config.from_file(self.checkpoint_dir / "model_config.yaml")

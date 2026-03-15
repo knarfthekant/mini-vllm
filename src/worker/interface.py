@@ -1,6 +1,10 @@
-from dataclasses import dataclass, field
-from typing import List
+from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List
+
+if TYPE_CHECKING:
+    from src.request import Request
 
 @dataclass
 class SchedulerOutput:
@@ -16,8 +20,15 @@ class SchedulerOutput:
     execution path is wired into the model.
     """
 
+    requests: List["Request"] = field(default_factory=list)
+    """The list of requests to be scheduled."""
+    
     input_ids: List[List[int]] = field(default_factory=list)
+    """The list of input IDs for each request."""
+
     positions: List[List[int]] = field(default_factory=list)
+    """The range of new prompt tokens for each request."""
+    
     block_tables: List[List[int]] = field(default_factory=list)
     slot_mappings: List[List[int]] = field(default_factory=list)
 
@@ -25,8 +36,7 @@ class SchedulerOutput:
 @dataclass
 class ModelRunnerOutput:
     """
-    Carries the per-step sampling result back from the ModelRunner to the
-    Executor / Engine.
+    Carries the per-step sampling result back from the ModelRunner to the Executor / Engine.
 
     sampled_token_ids[i] is the greedy next-token for request i.
     """

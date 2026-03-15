@@ -8,7 +8,6 @@ from typing import Tuple
 
 import torch
 
-from litgpt.config import Config  # type: ignore[import-untyped]
 from litgpt.model import GPT  # type: ignore[import-untyped]
 
 from src.config.vllm import BLOCK_SIZE, VllmConfig
@@ -20,10 +19,9 @@ from src.worker.cache_manager import (
     PagedKVCacheState,
     build_cache_manager,
 )
-from src.worker.model_input import ModelRunnerOutput, SchedulerOutput
+from src.worker.interface import SchedulerOutput, ModelRunnerOutput
 
 logger = logging.getLogger(__name__)
-
 
 class ModelRunner:
     """
@@ -36,6 +34,7 @@ class ModelRunner:
     """
 
     def __init__(self, vllm_config: VllmConfig) -> None:
+        logger.info("Initializing ModelRunner with config: %s", vllm_config)
         self.vllm_config = vllm_config
         self._cache_manager: BaseCacheManager = build_cache_manager(vllm_config.kv_cache_manager)
         self._model: GPT | None = None
@@ -88,7 +87,7 @@ class ModelRunner:
         if self.device.type == "cuda":
             self._init_gpu_free_bytes = torch.cuda.mem_get_info()[0]
 
-        config = Config.from_file(checkpoint_dir / "model_config.yaml")
+        config = self.vllm_config.model_config
         checkpoint_path = checkpoint_dir / "lit_model.pth"
 
         # Step 1 — stream weights from disk directly onto the target device.
@@ -215,6 +214,12 @@ class ModelRunner:
 
     def _prepare_inputs(self, scheduler_output: SchedulerOutput) -> ModelExecutionInputs:
         return self._cache_manager.prepare_model_inputs(self, scheduler_output)
+
+    def move_sequence_cache(self, src_slot: int, dst_slot: int) -> None:
+        self._cache_manager.move_sequence_cache(self, src_slot, dst_slot)
+
+    def clear_sequence_cache(self, slot: int) -> None:
+        self._cache_manager.clear_sequence_cache(self, slot)
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:

@@ -33,7 +33,7 @@ from typing import Any
 
 from src.config.vllm import BLOCK_SIZE, VllmConfig
 from src.worker.model_runner import ModelRunner
-from src.worker.model_input import SchedulerOutput
+from src.worker.interface import SchedulerOutput
 
 # --------------------------------------------------------------------------
 # Configuration

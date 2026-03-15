@@ -31,7 +31,7 @@ import torch
 
 from src.config.vllm import VllmConfig
 from src.engine.async_engine import AsyncEngine
-from src.worker.model_input import SchedulerOutput
+from src.worker.interface import SchedulerOutput
 
 from litgpt.tokenizer import Tokenizer  # type: ignore[import-untyped]
 
@@ -165,6 +165,7 @@ def main() -> int:
         checkpoint_dir=CHECKPOINT_DIR,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=0.9,
+        kv_cache_manager="standard",
     )
     engine = AsyncEngine(config)
     t_init = time.perf_counter() - t0
@@ -177,7 +178,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n[2/3] Loading tokenizer...")
     tokenizer = Tokenizer(CHECKPOINT_DIR)
-    eos_id: int = tokenizer.eos_id
+    eos_id: int = tokenizer.eos_id # type: ignore[assignment]
     print(f"      eos_id={eos_id}")
 
     # ------------------------------------------------------------------
@@ -187,7 +188,7 @@ def main() -> int:
 
     model_runner = engine.model_runner
     max_seq_length = engine.max_seq_length
-    if model_runner.attention_backend_name != "standard":
+    if model_runner.cache_manager_name != "standard":
         raise NotImplementedError(
             "test_generation.py currently exercises the standard attention path only."
         )

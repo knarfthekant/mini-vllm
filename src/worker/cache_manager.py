@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from src.config.vllm import BLOCK_SIZE
-from src.worker.model_input import SchedulerOutput
+from src.worker.interface import SchedulerOutput
 
 if TYPE_CHECKING:
     from src.worker.model_runner import ModelRunner
@@ -78,6 +78,21 @@ class BaseCacheManager(ABC):
     ) -> None:
         del runner, scheduler_output
 
+    def move_sequence_cache(
+        self,
+        runner: "ModelRunner",
+        src_slot: int,
+        dst_slot: int,
+    ) -> None:
+        del runner, src_slot, dst_slot
+
+    def clear_sequence_cache(
+        self,
+        runner: "ModelRunner",
+        slot: int,
+    ) -> None:
+        del runner, slot
+
     def prepare_model_inputs(
         self,
         runner: "ModelRunner",
@@ -122,8 +137,9 @@ class StandardCacheManager(BaseCacheManager):
         if bytes_per_token == 0:
             raise RuntimeError("bytes_per_token is zero; model config may be invalid")
 
+        # The max sequence length is the COMPUTED max number of tokens capped at the configured max sequence length
         max_seq_length = bytes_for_kv // bytes_per_token
-        max_seq_length = _align_max_seq_length(runner, max_seq_length)
+        max_seq_length = _align_to_block_size(min(max_seq_length, _configured_max_seq_length(runner)))
         num_gpu_blocks = max_seq_length // BLOCK_SIZE
 
         logger.info(
@@ -168,6 +184,35 @@ class StandardCacheManager(BaseCacheManager):
         _ = model_inputs.attn_metadata
         return runner.model(model_inputs.input_ids, input_pos=model_inputs.positions)
 
+    def move_sequence_cache(
+        self,
+        runner: "ModelRunner",
+        src_slot: int,
+        dst_slot: int,
+    ) -> None:
+        if src_slot == dst_slot:
+            return
+        for block in runner.model.transformer.h:
+            kv = block.attn.kv_cache
+            if kv is None:
+                raise RuntimeError("KV cache must be initialized before moving slots")
+            kv.k[dst_slot].copy_(kv.k[src_slot])
+            kv.v[dst_slot].copy_(kv.v[src_slot])
+            kv.k[src_slot].zero_()
+            kv.v[src_slot].zero_()
+
+    def clear_sequence_cache(
+        self,
+        runner: "ModelRunner",
+        slot: int,
+    ) -> None:
+        for block in runner.model.transformer.h:
+            kv = block.attn.kv_cache
+            if kv is None:
+                raise RuntimeError("KV cache must be initialized before clearing slots")
+            kv.k[slot].zero_()
+            kv.v[slot].zero_()
+
 
 class PagedCacheManager(BaseCacheManager):
     name = "paged"
@@ -183,10 +228,8 @@ class PagedCacheManager(BaseCacheManager):
             raise RuntimeError("bytes_per_block is zero; model config may be invalid")
 
         num_gpu_blocks = max(1, bytes_for_kv // bytes_per_block)
-        max_seq_length = _align_max_seq_length(
-            runner,
-            _configured_max_seq_length(runner),
-        )
+        # The max sequence length is the CONFIGURED max sequence length
+        max_seq_length = _align_to_block_size(_configured_max_seq_length(runner))
 
         blocks_per_seq = math.ceil(max_seq_length / BLOCK_SIZE)
         required_blocks = blocks_per_seq * runner.vllm_config.max_num_seqs
@@ -286,6 +329,7 @@ class PagedCacheManager(BaseCacheManager):
 
 
 def build_cache_manager(name: str) -> BaseCacheManager:
+    logger.info("Initializing cache manager: %s", name)
     backends: dict[str, type[BaseCacheManager]] = {
         StandardCacheManager.name: StandardCacheManager,
         PagedCacheManager.name: PagedCacheManager,
@@ -307,9 +351,9 @@ def _configured_max_seq_length(runner: "ModelRunner") -> int:
     return min(configured, model_limit)
 
 
-def _align_max_seq_length(runner: "ModelRunner", max_seq_length: int) -> int:
-    max_seq_length = min(max_seq_length, _configured_max_seq_length(runner))
-    return max(BLOCK_SIZE, (max_seq_length // BLOCK_SIZE) * BLOCK_SIZE)
+def _align_to_block_size(value: int) -> int:
+    """Align value down to the nearest BLOCK_SIZE multiple, minimum BLOCK_SIZE."""
+    return max(BLOCK_SIZE, (value // BLOCK_SIZE) * BLOCK_SIZE)
 
 
 def _kv_bytes_per_token_position(runner: "ModelRunner") -> int:

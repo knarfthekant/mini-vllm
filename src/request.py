@@ -146,11 +146,11 @@ class Request:
         Append one generated token and advance all counters.
 
         Automatically transitions to FINISHED_LENGTH_CAPPED when max_tokens
-        is reached.  Raises if the request is already finished.
+        is reached. Raises if the request is already finished.
         """
         if self.is_finished():
             raise RuntimeError(
-                f"Cannot append token to finished request {self.request_id!r} "
+                f"Cannot append token to finished request {self.request_id!r}"
                 f"(status={self.status.name})"
             )
 
