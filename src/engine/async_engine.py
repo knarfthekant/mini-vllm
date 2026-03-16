@@ -9,6 +9,7 @@ from src.engine.allocator import DenseSlotManager, PagedBlockManager
 from src.request import Request
 from src.sampling_params import SamplingParams
 from src.worker.model_runner import ModelRunner
+from litgpt.tokenizer import Tokenizer
 from .scheduler import Scheduler, SchedulerPostprocessResult
 
 logger = logging.getLogger(__name__)
@@ -24,20 +25,21 @@ class AsyncEngine:
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
-        eos_token_id: int | None = None,
+        vllm_config: VllmConfig
     ) -> None:
+        logger.info("Initializing AsyncEngine with config: %s", vllm_config)
         self.vllm_config = vllm_config
-        self.eos_token_id = eos_token_id
         self._shutdown = False
         self._completed_requests: deque[Request] = deque()
         self._requests: dict[str, Request] = {}
 
-        logger.info("Initializing AsyncEngine with config: %s", self.vllm_config)
-
         # Configuring model
         self.model_runner = ModelRunner(self.vllm_config)
         self.model_runner.load_model()
+
+        # Configuring tokenizer
+        self.tokenizer = Tokenizer(self.vllm_config.checkpoint_dir)
+        self.eos_token_id = self.tokenizer.eos_id
 
         # Profile memory, size the KV cache, allocate buffers
         self._initialize_kv_caches()
@@ -81,10 +83,17 @@ class AsyncEngine:
 
     def add_request(
         self,
-        prompt_token_ids: list[int],
+        prompt: str | list[int],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
     ) -> Request:
+        if isinstance(prompt, str):
+            prompt_token_ids = self.tokenizer.encode(prompt).tolist()
+        else:
+            prompt_token_ids = prompt
+
+        logger.debug("Adding request with prompt: %s, prompt_token_ids: %s, sampling_params: %s, request_id: %s", prompt, prompt_token_ids, sampling_params, request_id)
+        
         request = Request(
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,

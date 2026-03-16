@@ -98,6 +98,7 @@ class BaseCacheManager(ABC):
         runner: "ModelRunner",
         scheduler_output: SchedulerOutput,
     ) -> ModelExecutionInputs:
+        """Pad input_ids and positions to the same length to conform to litgpt model input requirements."""
         seqs = scheduler_output.input_ids
         pos_seqs = scheduler_output.positions
 
@@ -107,8 +108,15 @@ class BaseCacheManager(ABC):
             raise ValueError("input_ids and positions must have the same batch size")
 
         max_len = max(len(seq) for seq in seqs)
-        padded_ids = [seq + [0] * (max_len - len(seq)) for seq in seqs]
-        padded_pos = [pos + [0] * (max_len - len(pos)) for pos in pos_seqs]
+        # Pad with each sequence's last token and last position so we never write
+        # token_id 0 or position 0 into the KV cache (which would overwrite
+        # the start of the context and cause drift / trailing padding tokens).
+        padded_ids = [
+            seq + [seq[-1]] * (max_len - len(seq)) for seq in seqs
+        ]
+        padded_pos = [
+            pos + [pos[-1]] * (max_len - len(pos)) for pos in pos_seqs
+        ]
 
         return ModelExecutionInputs(
             input_ids=torch.tensor(padded_ids, dtype=torch.long, device=runner.device),
@@ -139,6 +147,8 @@ class StandardCacheManager(BaseCacheManager):
 
         # The max sequence length is the COMPUTED max number of tokens capped at the configured max sequence length
         max_seq_length = bytes_for_kv // bytes_per_token
+        logger.debug("StandardCacheManager raw computed: %d max_seq_length = %d bytes_for_kv / %d bytes_per_token", max_seq_length, bytes_for_kv, bytes_per_token)
+
         max_seq_length = _align_to_block_size(min(max_seq_length, _configured_max_seq_length(runner)))
         num_gpu_blocks = max_seq_length // BLOCK_SIZE
 

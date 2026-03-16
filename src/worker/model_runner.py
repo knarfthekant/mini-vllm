@@ -34,7 +34,7 @@ class ModelRunner:
     """
 
     def __init__(self, vllm_config: VllmConfig) -> None:
-        logger.info("Initializing ModelRunner with config: %s", vllm_config)
+        logger.info("Initializing ModelRunner")
         self.vllm_config = vllm_config
         self._cache_manager: BaseCacheManager = build_cache_manager(vllm_config.kv_cache_manager)
         self._model: GPT | None = None
@@ -216,10 +216,14 @@ class ModelRunner:
         return self._cache_manager.prepare_model_inputs(self, scheduler_output)
 
     def move_sequence_cache(self, src_slot: int, dst_slot: int) -> None:
-        self._cache_manager.move_sequence_cache(self, src_slot, dst_slot)
+        # allow tensor to be modified in-place
+        with torch.inference_mode():
+            self._cache_manager.move_sequence_cache(self, src_slot, dst_slot)
 
     def clear_sequence_cache(self, slot: int) -> None:
-        self._cache_manager.clear_sequence_cache(self, slot)
+        # allow tensor to be modified in-place
+        with torch.inference_mode():
+            self._cache_manager.clear_sequence_cache(self, slot)
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:

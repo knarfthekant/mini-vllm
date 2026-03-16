@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import logging
 from typing import Deque
 
 from src.config.vllm import VllmConfig
@@ -14,6 +15,7 @@ from src.engine.allocator import (
 from src.request import Request, RequestStatus
 from src.worker.interface import ModelRunnerOutput, SchedulerOutput
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class SchedulerPostprocessResult:
@@ -90,6 +92,7 @@ class Scheduler:
         # Schedule running requests (Priority)
         for request in running:
             if budget < 1:
+                logger.debug("Stopping due to low budget. Budget: %d", budget)
                 scheduled_all_running = False
                 break
             # Cap running requests to the max sequence length
@@ -102,6 +105,7 @@ class Scheduler:
                 continue
             # If running requests exceed the allocator capacity, stop scheduling
             if not self.allocator.can_append(request):
+                logger.debug("Stopping due to allocator capacity. Request: %s", request)
                 scheduled_all_running = False
                 break
 
@@ -166,6 +170,7 @@ class Scheduler:
             if request.status != RequestStatus.RUNNING:
                 request.status = RequestStatus.RUNNING
 
+            # Update request with the sampled token
             request.append_token(sampled_token)
 
             if (
@@ -214,6 +219,7 @@ class Scheduler:
         positions: list[list[int]],
         block_tables: list[list[int]],
     ) -> SchedulerOutput:
+        # logger.debug("Building output. Requests: %s, Input IDs: %s, Positions: %s, Block Tables: %s", requests, input_ids, positions, block_tables)
         return SchedulerOutput(
             requests=requests,
             input_ids=input_ids,
