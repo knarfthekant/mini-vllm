@@ -237,6 +237,7 @@ class PagedCacheManager(BaseCacheManager):
         if bytes_per_block == 0:
             raise RuntimeError("bytes_per_block is zero; model config may be invalid")
 
+        # Actual available blocks in the pool
         num_gpu_blocks = max(1, bytes_for_kv // bytes_per_block)
         # The max sequence length is the CONFIGURED max sequence length
         max_seq_length = _align_to_block_size(_configured_max_seq_length(runner))
@@ -290,10 +291,11 @@ class PagedCacheManager(BaseCacheManager):
         for _ in range(cfg.n_layer):
             layers.append(
                 PagedLayerKVCache(
+                    # [num_gpu_blocks, n_query_groups, BLOCK_SIZE, head_dim]
                     key_blocks=torch.empty(
                         (
                             plan.num_gpu_blocks,
-                            cfg.n_query_groups,
+                            cfg.n_query_groups, # number of query heads
                             BLOCK_SIZE,
                             head_dim,
                         ),

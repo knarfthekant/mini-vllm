@@ -116,6 +116,7 @@ class Scheduler:
             block_tables.append(list(request.block_table))
             budget -= 1
 
+        # Allocate new requests
         if scheduled_all_running and budget > 0:
             while self.waiting and len(self.running) < self.max_num_seqs:
                 request = self.waiting[0]

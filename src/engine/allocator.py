@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Protocol
 
 from src.config.vllm import BLOCK_SIZE
 from src.request import Request
 
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 @dataclass(frozen=True)
 class SlotMove:
@@ -18,31 +22,67 @@ class FreeResult:
     cleared_slot: int | None = None
     slot_move: SlotMove | None = None
 
+class PagedBlock:
+    def __init__(self, block_id: int) -> None:
+        self.block_id = block_id
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
+
+    def update(self, hash: int, token_ids: list[int]) -> None:
+        """A helper method to update the block's hash and token ids."""
+        self.hash = hash
+        self.token_ids = token_ids
+
+    def reset(self) -> None:
+        """Reset the block before an allocation, automatically adding a reference count."""
+        self.ref_count = 1
+        self.hash = -1
+        self.token_ids = []
+
 
 class AllocationManager(Protocol):
     def can_allocate(self, request: Request) -> bool: ...
+    """Check if there are enough free blocks to admit the new request."""
 
     def allocate(self, request: Request) -> None: ...
+    """Allocate blocks for the request."""
 
     def can_append(self, request: Request) -> bool: ...
+    """Check if new blocks are needed to append the request's tokens."""
 
     def append(self, request: Request) -> None: ...
+    """Update the block table for the request."""
 
     def free(self, request: Request) -> FreeResult: ...
-
+    """Free the blocks for the request."""
 
 class PagedBlockManager:
-    """Engine-side free-list allocator for the paged KV backend."""
+    """Virtual sequence block allocator for the paged KV backend."""
 
     def __init__(self, num_gpu_blocks: int, block_size: int = BLOCK_SIZE) -> None:
         if num_gpu_blocks < 1:
             raise ValueError(f"num_gpu_blocks must be >= 1, got {num_gpu_blocks}")
         self.block_size = block_size
-        self._free_blocks = list(range(num_gpu_blocks))
+        self.blocks = [PagedBlock(i) for i in range(num_gpu_blocks)]
+        # Hash table to map the hash of the block's token ids to the block id
+        self.hash_to_block_id: dict[int, int] = dict()
+        self.free_block_ids: deque[int] = deque(range(num_gpu_blocks))
+        self.used_block_ids: set[int] = set()
+        
+        logger.info("PagedBlockManager initialized with %d blocks", num_gpu_blocks)
 
+
+    # TODO: Unify allocation by simply computing the number of blocks needed to allocates,
+    # and then allocate the blocks. 
     def can_allocate(self, request: Request) -> bool:
-        return len(self._free_blocks) >= self._num_missing_blocks(request)
+        return len(self.free_block_ids) >= request.num_required_blocks
 
+    def allocate(self, request: Request) -> None:
+        # Request's block table should be empty
+        assert request.block_table == []
+        for i in range(request.num_blocks):
+            
     def allocate(self, request: Request) -> None:
         self._allocate_missing_blocks(request)
 
@@ -57,6 +97,8 @@ class PagedBlockManager:
             self._free_blocks.append(request.block_table.pop())
         request.num_cached_tokens = 0
         return FreeResult()
+    
+    def _compute_hash(self, token_ids: list[int]) -> int:
 
     def _allocate_missing_blocks(self, request: Request) -> None:
         missing = self._num_missing_blocks(request)
@@ -67,15 +109,11 @@ class PagedBlockManager:
         for _ in range(missing):
             request.block_table.append(self._free_blocks.pop())
 
-    def _num_missing_blocks(self, request: Request) -> int:
-        required_blocks = (request.num_tokens + self.block_size - 1) // self.block_size
-        return required_blocks - len(request.block_table)
 
 
 class DenseSlotManager:
     """
-    Scheduler-visible capacity accounting for the dense KV backend.
-
+    Virtual sequence slot allocator for the dense KV backend.
     Dense KV caches are row-based, so each active request must own a stable slot.
     This manager keeps those slot assignments compact so the active batch can
     always occupy the first ``num_running`` rows of the model KV cache.

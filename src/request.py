@@ -3,6 +3,7 @@ import uuid
 from copy import copy
 from enum import IntEnum, auto
 from typing import List, Optional
+from src.config.vllm import BLOCK_SIZE
 
 from src.sampling_params import SamplingParams
 
@@ -77,6 +78,7 @@ class Request:
         self.token_ids: List[int] = copy(prompt_token_ids)
         self.num_prompt_tokens: int = len(prompt_token_ids)
         self.num_tokens: int = len(prompt_token_ids)  # plain int, not property
+        self.num_cached_tokens: int = 0
         self.last_token: int = prompt_token_ids[-1]
 
         # Sampling parameters (flattened from SamplingParams for hot-path access)
@@ -84,18 +86,13 @@ class Request:
         self.max_tokens: int = sampling_params.max_tokens
         self.ignore_eos: bool = sampling_params.ignore_eos
 
-        # KV-cache stubs — populated by the block manager once paged attention
-        # is implemented.
-        self.num_cached_tokens: int = 0
+        # KV cache related
         self.block_table: List[int] = []
 
         self.status: RequestStatus = RequestStatus.WAITING
         self.stop_reason: Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # Token views (slice-based; no extra allocations until needed)
-    # ------------------------------------------------------------------
-
+    # Token views
     @property
     def prompt_token_ids(self) -> List[int]:
         return self.token_ids[: self.num_prompt_tokens]
@@ -108,36 +105,32 @@ class Request:
     def num_completion_tokens(self) -> int:
         return self.num_tokens - self.num_prompt_tokens
 
-    # ------------------------------------------------------------------
-    # Block helpers (stubs; values become meaningful with paged attention)
-    # ------------------------------------------------------------------
-
-    @property
-    def num_cached_blocks(self) -> int:
-        from src.config.vllm import BLOCK_SIZE
-        return self.num_cached_tokens // BLOCK_SIZE
-
     @property
     def num_blocks(self) -> int:
-        from src.config.vllm import BLOCK_SIZE
+        """Return the number of cache blocks the request logically needs to store all of its token"""
         return (self.num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     @property
+    def num_cached_blocks(self) -> int:
+        """Return the number of blocks backed by the cache memory right now"""
+        return self.num_cached_tokens // BLOCK_SIZE
+
+    @property
+    def num_required_blocks(self) -> int:
+        """Return the number of cache blocks the request logically needs to store all of its token"""
+        return self.num_blocks - len(self.block_table)
+
+    @property
     def last_block_num_tokens(self) -> int:
-        from src.config.vllm import BLOCK_SIZE
         return self.num_tokens - (self.num_blocks - 1) * BLOCK_SIZE
 
     def get_block_token_ids(self, block_idx: int) -> List[int]:
-        """Return the token IDs that belong to block ``block_idx``."""
-        from src.config.vllm import BLOCK_SIZE
+        """Return the token IDs that belong to block 'block_idx'."""
         assert 0 <= block_idx < self.num_blocks
         start = block_idx * BLOCK_SIZE
         return self.token_ids[start : start + BLOCK_SIZE]
 
-    # ------------------------------------------------------------------
     # Lifecycle helpers
-    # ------------------------------------------------------------------
-
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
 
@@ -161,10 +154,7 @@ class Request:
         if self.num_completion_tokens >= self.max_tokens:
             self.status = RequestStatus.FINISHED_LENGTH_CAPPED
 
-    # ------------------------------------------------------------------
     # Sequence-protocol helpers (mirrors nano-vllm for scheduler compat)
-    # ------------------------------------------------------------------
-
     def __len__(self) -> int:
         return self.num_tokens
 
