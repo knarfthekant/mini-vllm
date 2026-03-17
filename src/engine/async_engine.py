@@ -80,7 +80,6 @@ class AsyncEngine:
         )
 
     # Request handling
-
     def add_request(
         self,
         prompt: str | list[int],
