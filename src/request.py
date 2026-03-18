@@ -3,7 +3,6 @@ import uuid
 from copy import copy
 from enum import IntEnum, auto
 from typing import List, Optional
-from src.config.vllm import BLOCK_SIZE
 
 from src.sampling_params import SamplingParams
 
@@ -48,9 +47,9 @@ class Request:
 
     KV-cache stubs
     ──────────────
-    ``block_table`` and ``num_cached_tokens`` are present as stubs so the
-    scheduler and block manager can be wired up later without changing the
-    Request interface.
+    ``num_cached_tokens`` tracks how many tokens are already materialized in
+    KV cache for this request. Backend-specific placement metadata lives in the
+    allocator, not on the request object.
 
     Args:
         prompt_token_ids: Tokenised prompt (copied; not modified after init).
@@ -86,9 +85,6 @@ class Request:
         self.max_tokens: int = sampling_params.max_tokens
         self.ignore_eos: bool = sampling_params.ignore_eos
 
-        # KV cache related
-        self.block_table: List[int] = []
-
         self.status: RequestStatus = RequestStatus.WAITING
         self.stop_reason: Optional[str] = None
 
@@ -104,31 +100,6 @@ class Request:
     @property
     def num_completion_tokens(self) -> int:
         return self.num_tokens - self.num_prompt_tokens
-
-    @property
-    def num_blocks(self) -> int:
-        """Return the number of cache blocks the request logically needs to store all of its token"""
-        return (self.num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
-
-    @property
-    def num_cached_blocks(self) -> int:
-        """Return the number of blocks backed by the cache memory right now"""
-        return self.num_cached_tokens // BLOCK_SIZE
-
-    @property
-    def num_required_blocks(self) -> int:
-        """Return the number of cache blocks the request logically needs to store all of its token"""
-        return self.num_blocks - len(self.block_table)
-
-    @property
-    def last_block_num_tokens(self) -> int:
-        return self.num_tokens - (self.num_blocks - 1) * BLOCK_SIZE
-
-    def get_block_token_ids(self, block_idx: int) -> List[int]:
-        """Return the token IDs that belong to block 'block_idx'."""
-        assert 0 <= block_idx < self.num_blocks
-        start = block_idx * BLOCK_SIZE
-        return self.token_ids[start : start + BLOCK_SIZE]
 
     # Lifecycle helpers
     def is_finished(self) -> bool:

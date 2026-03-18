@@ -11,6 +11,7 @@ import torch
 from litgpt.model import GPT  # type: ignore[import-untyped]
 
 from src.config.vllm import BLOCK_SIZE, VllmConfig
+from src.engine.allocator import AllocatorEvent
 from src.worker.cache_manager import (
     BaseCacheManager,
     DenseKVCacheState,
@@ -215,15 +216,11 @@ class ModelRunner:
     def _prepare_inputs(self, scheduler_output: SchedulerOutput) -> ModelExecutionInputs:
         return self._cache_manager.prepare_model_inputs(self, scheduler_output)
 
-    def move_sequence_cache(self, src_slot: int, dst_slot: int) -> None:
-        # allow tensor to be modified in-place
+    def apply_allocator_events(self, events: list[AllocatorEvent]) -> None:
+        if not events:
+            return
         with torch.inference_mode():
-            self._cache_manager.move_sequence_cache(self, src_slot, dst_slot)
-
-    def clear_sequence_cache(self, slot: int) -> None:
-        # allow tensor to be modified in-place
-        with torch.inference_mode():
-            self._cache_manager.clear_sequence_cache(self, slot)
+            self._cache_manager.apply_allocator_events(self, events)
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:

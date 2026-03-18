@@ -68,16 +68,14 @@ class AsyncEngine:
         # Registering KV cache limits with the scheduler
         self.num_gpu_blocks = plan.num_gpu_blocks
         self.max_seq_length = plan.max_seq_length
+        self.kv_cache_backend_name = plan.backend_name
 
         logger.info("KV cache manager initialisation complete.")
 
     def _build_allocator(self) -> DenseSlotManager | PagedBlockManager:
-        if self.model_runner.cache_manager_name == "paged":
+        if self.kv_cache_backend_name == "paged":
             return PagedBlockManager(self.num_gpu_blocks)
-        return DenseSlotManager(
-            max_num_seqs=self.vllm_config.max_num_seqs,
-            max_seq_length=self.max_seq_length,
-        )
+        return DenseSlotManager(max_num_seqs=self.vllm_config.max_num_seqs)
 
     # Request handling
     def add_request(
@@ -170,10 +168,6 @@ class AsyncEngine:
         result: SchedulerPostprocessResult,
     ) -> list[Request]:
         """Apply the postprocess result to the model runner and the completed requests."""
-        for slot_move in result.slot_moves:
-            self.model_runner.move_sequence_cache(slot_move.src_slot, slot_move.dst_slot)
-        for slot in result.cleared_slots:
-            self.model_runner.clear_sequence_cache(slot)
-
+        self.model_runner.apply_allocator_events(result.allocator_events)
         self._completed_requests.extend(result.finished_requests)
         return result.finished_requests

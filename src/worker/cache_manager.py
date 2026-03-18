@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from src.config.vllm import BLOCK_SIZE
+from src.engine.allocator import AllocatorEvent, ClearDenseSlot, MoveDenseSlot
 from src.worker.interface import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -78,20 +79,12 @@ class BaseCacheManager(ABC):
     ) -> None:
         del runner, scheduler_output
 
-    def move_sequence_cache(
+    def apply_allocator_events(
         self,
         runner: "ModelRunner",
-        src_slot: int,
-        dst_slot: int,
+        events: list[AllocatorEvent],
     ) -> None:
-        del runner, src_slot, dst_slot
-
-    def clear_sequence_cache(
-        self,
-        runner: "ModelRunner",
-        slot: int,
-    ) -> None:
-        del runner, slot
+        del runner, events
 
     def prepare_model_inputs(
         self,
@@ -194,7 +187,7 @@ class StandardCacheManager(BaseCacheManager):
         _ = model_inputs.attn_metadata
         return runner.model(model_inputs.input_ids, input_pos=model_inputs.positions)
 
-    def move_sequence_cache(
+    def _move_sequence_cache(
         self,
         runner: "ModelRunner",
         src_slot: int,
@@ -211,7 +204,7 @@ class StandardCacheManager(BaseCacheManager):
             kv.k[src_slot].zero_()
             kv.v[src_slot].zero_()
 
-    def clear_sequence_cache(
+    def _clear_sequence_cache(
         self,
         runner: "ModelRunner",
         slot: int,
@@ -222,6 +215,17 @@ class StandardCacheManager(BaseCacheManager):
                 raise RuntimeError("KV cache must be initialized before clearing slots")
             kv.k[slot].zero_()
             kv.v[slot].zero_()
+
+    def apply_allocator_events(
+        self,
+        runner: "ModelRunner",
+        events: list[AllocatorEvent],
+    ) -> None:
+        for event in events:
+            if isinstance(event, MoveDenseSlot):
+                self._move_sequence_cache(runner, event.src_slot, event.dst_slot)
+            elif isinstance(event, ClearDenseSlot):
+                self._clear_sequence_cache(runner, event.slot)
 
 
 class PagedCacheManager(BaseCacheManager):

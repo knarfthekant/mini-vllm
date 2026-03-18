@@ -8,11 +8,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "litgpt"))
 
-from src.config.vllm import BLOCK_SIZE, VllmConfig
+from src.config.vllm import VllmConfig
 from src.engine.async_engine import AsyncEngine
-from src.worker.interface import SchedulerOutput
 
-from litgpt.tokenizer import Tokenizer  # type: ignore[import-untyped]
 
 import logging
 import torch

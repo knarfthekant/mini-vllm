@@ -8,9 +8,7 @@ from typing import Deque
 from src.config.vllm import VllmConfig
 from src.engine.allocator import (
     AllocationManager,
-    DenseSlotManager,
-    FreeResult,
-    SlotMove,
+    AllocatorEvent,
 )
 from src.request import Request, RequestStatus
 from src.worker.interface import ModelRunnerOutput, SchedulerOutput
@@ -20,8 +18,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SchedulerPostprocessResult:
     finished_requests: list[Request] = field(default_factory=list)
-    cleared_slots: list[int] = field(default_factory=list)
-    slot_moves: list[SlotMove] = field(default_factory=list)
+    allocator_events: list[AllocatorEvent] = field(default_factory=list)
 
 
 class Scheduler:
@@ -63,6 +60,7 @@ class Scheduler:
         request = self._remove_from_waiting(request_id)
         if request is not None:
             request.status = RequestStatus.FINISHED_ABORTED
+            request.stop_reason = "aborted"
             return SchedulerPostprocessResult(finished_requests=[request])
 
         request = self._remove_from_running(request_id)
@@ -70,10 +68,9 @@ class Scheduler:
             return None
 
         request.status = RequestStatus.FINISHED_ABORTED
-        free_result = self.allocator.free(request)
         request.stop_reason = "aborted"
-        result = SchedulerPostprocessResult(finished_requests=[request])
-        self._append_free_result(result, free_result)
+        result = SchedulerPostprocessResult()
+        self._release_request(request, result, include_finished=True)
         return result
 
     def has_unfinished_requests(self) -> bool:
@@ -110,10 +107,15 @@ class Scheduler:
                 break
 
             self.allocator.append(request)
-            scheduled.append(request)
-            input_ids.append([request.last_token])
-            positions.append([request.num_tokens - 1]) # only the last token is new
-            block_tables.append(list(request.block_table))
+            self._append_scheduled_request(
+                scheduled,
+                input_ids,
+                positions,
+                block_tables,
+                request,
+                [request.last_token],
+                [request.num_tokens - 1],
+            )
             budget -= 1
 
         # Allocate new requests
@@ -134,14 +136,15 @@ class Scheduler:
                 request.status = RequestStatus.RUNNING
                 self.running.append(request)
 
-                scheduled.append(request)
-                input_ids.append(
-                    request.token_ids[request.num_cached_tokens : request.num_tokens]
+                self._append_scheduled_request(
+                    scheduled,
+                    input_ids,
+                    positions,
+                    block_tables,
+                    request,
+                    request.token_ids[request.num_cached_tokens : request.num_tokens],
+                    list(range(request.num_cached_tokens, request.num_tokens)),
                 )
-                positions.append(
-                    list(range(request.num_cached_tokens, request.num_tokens))
-                )
-                block_tables.append(list(request.block_table))
                 budget -= num_new_tokens
 
         return self._build_output(scheduled, input_ids, positions, block_tables)
@@ -197,9 +200,7 @@ class Scheduler:
                 result.finished_requests.append(request)
 
         for request in result.finished_requests:
-            self._remove_running_request_object(request)
-            free_result = self.allocator.free(request)
-            self._append_free_result(result, free_result)
+            self._release_request(request, result, include_finished=False)
 
         return result
 
@@ -209,9 +210,7 @@ class Scheduler:
         return result
 
     def _running_in_execution_order(self) -> list[Request]:
-        if isinstance(self.allocator, DenseSlotManager):
-            return sorted(self.running, key=self.allocator.slot_of)
-        return list(self.running)
+        return sorted(self.running, key=self.allocator.execution_key)
 
     def _build_output(
         self,
@@ -248,16 +247,33 @@ class Scheduler:
         """Remove the request object from the running list."""
         self.running = [running for running in self.running if running is not request]
 
-    def _append_free_result(
+    def _append_scheduled_request(
         self,
-        result: SchedulerPostprocessResult,
-        free_result: FreeResult,
+        requests: list[Request],
+        input_ids: list[list[int]],
+        positions: list[list[int]],
+        block_tables: list[list[int]],
+        request: Request,
+        request_input_ids: list[int],
+        request_positions: list[int],
     ) -> None:
-        """Append allocator changes to the postprocess result."""
-        if free_result.slot_move is not None:
-            result.slot_moves.append(free_result.slot_move)
-        if free_result.cleared_slot is not None:
-            result.cleared_slots.append(free_result.cleared_slot)
+        batch_state = self.allocator.export_batch_state(request)
+        requests.append(request)
+        input_ids.append(request_input_ids)
+        positions.append(request_positions)
+        block_tables.append(batch_state.block_table)
+
+    def _release_request(
+        self,
+        request: Request,
+        result: SchedulerPostprocessResult,
+        *,
+        include_finished: bool,
+    ) -> None:
+        self._remove_running_request_object(request)
+        if include_finished:
+            result.finished_requests.append(request)
+        result.allocator_events.extend(self.allocator.free(request))
 
     def _finish_without_execution(
         self,
@@ -267,7 +283,4 @@ class Scheduler:
     ) -> None:
         request.status = status
         request.stop_reason = stop_reason
-        self._remove_running_request_object(request)
-        free_result = self.allocator.free(request)
-        self._pending_result.finished_requests.append(request)
-        self._append_free_result(self._pending_result, free_result)
+        self._release_request(request, self._pending_result, include_finished=True)
