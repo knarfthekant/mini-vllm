@@ -8,7 +8,7 @@ from typing import Protocol
 import numpy as np
 import xxhash
 
-from src.config.vllm import BLOCK_SIZE
+from src.config.vllm import BLOCK_SIZE, PAGED_BLOCK_SIZE
 from src.request import Request
 
 logger = getLogger(__name__)
@@ -82,7 +82,7 @@ class PagedRequestState:
 class PagedBlockManager:
     """Virtual sequence block allocator for the paged KV backend."""
 
-    def __init__(self, num_gpu_blocks: int, block_size: int = BLOCK_SIZE) -> None:
+    def __init__(self, num_gpu_blocks: int, block_size: int = PAGED_BLOCK_SIZE) -> None:
         if num_gpu_blocks < 1:
             raise ValueError(f"num_gpu_blocks must be >= 1, got {num_gpu_blocks}")
         self.block_size = block_size

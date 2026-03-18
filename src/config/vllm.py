@@ -11,9 +11,18 @@ from pydantic.dataclasses import dataclass
 if TYPE_CHECKING:
     from litgpt.config import Config
 
-# Number of tokens per KV-cache block.  Matches nano-vllm; used by Request's
-# block helpers and the KV-cache size computation.
+# Number of tokens per KV-cache block for the *dense* backend. Matches nano-vllm;
+# used by Request's block helpers and the dense KV-cache size computation.
+#
+# Note: the paged KV backend may use a different block size depending on the
+# attention kernel's requirements.
 BLOCK_SIZE: int = 16
+
+# Number of tokens per block for the *paged* KV backend.
+#
+# Keep this separate from the dense backend's BLOCK_SIZE so we can tune paged
+# kernel behavior independently without changing dense-cache behavior.
+PAGED_BLOCK_SIZE: int = 256
 BaseCacheManager = Literal["standard", "paged"]
 
 

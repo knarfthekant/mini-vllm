@@ -26,6 +26,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,  # change to DEBUG if needed
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT_DIR = ROOT / "checkpoints" / "meta-llama" / "Meta-Llama-3.1-8B-Instruct"

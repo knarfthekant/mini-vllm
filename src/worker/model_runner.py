@@ -245,8 +245,9 @@ class ModelRunner:
         model_inputs = self._prepare_inputs(scheduler_output)
 
         logits = self._cache_manager.forward(self, model_inputs)
-        # logits: (B, T, vocab_size) — take last token for each sequence
-        next_token_ids = logits[:, -1, :].argmax(dim=-1).tolist()
+        batch_indices = torch.arange(logits.size(0), device=logits.device)
+        last_logits = logits[batch_indices, model_inputs.last_token_indices, :]
+        next_token_ids = last_logits.argmax(dim=-1).tolist()
 
         return ModelRunnerOutput(sampled_token_ids=next_token_ids)
 
