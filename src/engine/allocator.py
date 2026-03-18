@@ -168,6 +168,7 @@ class PagedBlockManager:
                     and self.blocks[candidate_id].hash == rolling
                     and self.blocks[candidate_id].token_ids == token_ids
                 ):
+                    # Cache hit: share the existing block
                     block = self.blocks[candidate_id]
                     if block.ref_count == 0:
                         try:
@@ -306,6 +307,7 @@ class DenseSlotManager:
             raise RuntimeError("request cannot append in dense KV cache")
 
     def free(self, request: Request) -> list[AllocatorEvent]:
+        """Free a dense KV slot and return operations to adjust the slot assignment."""
         slot = self._request_to_slot.pop(request.request_id, None)
         request.num_cached_tokens = 0
         if slot is None:

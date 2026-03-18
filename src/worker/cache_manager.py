@@ -221,6 +221,7 @@ class StandardCacheManager(BaseCacheManager):
         runner: "ModelRunner",
         events: list[AllocatorEvent],
     ) -> None:
+        """Apply adjustments to the model's KV cache."""
         for event in events:
             if isinstance(event, MoveDenseSlot):
                 self._move_sequence_cache(runner, event.src_slot, event.dst_slot)

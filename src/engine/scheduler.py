@@ -270,6 +270,7 @@ class Scheduler:
         *,
         include_finished: bool,
     ) -> None:
+        """Release a request from finished list and return the allocator events."""
         self._remove_running_request_object(request)
         if include_finished:
             result.finished_requests.append(request)
