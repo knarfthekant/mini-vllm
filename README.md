@@ -104,7 +104,7 @@ That makes it easy to benchmark dense vs paged attention on the same style of wo
 ## Benchmark results
 
 
-The repository already includes a dense-vs-paged ShareGPT comparison for 16 prompts with mean prompt length around 950 tokens, ran on a single RTX5090 node with 32gb VRAM (approximately 15gb for KV Cache)
+The repository already includes a dense-vs-paged ShareGPT comparison, ran on a single RTX5090 node with 32gb VRAM
 
 ##### 16 prompts with mediam length 210 tokens (burst mode)
 ![Graph Summary](./benchmark_results/comparison-16-prompts-token-mean-210.svg)
