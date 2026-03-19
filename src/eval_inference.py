@@ -2,20 +2,23 @@
 """
 Inference benchmark harness for mini-vLLM.
 
-This script focuses on request-level latency and throughput measurements for
-the current dense backend while keeping the same workload and report format for
-future dense-vs-paged comparisons.
+This script measures request-level latency and throughput for the current dense
+and paged backends. It can also sample a varied-length ShareGPT workload and
+render a side-by-side TTFT/throughput comparison graph from two summaries.
 
 Examples:
-    python -m src.scripts.eval_inference run
-    python -m src.scripts.eval_inference run --arrival-mode fixed-rate --request-rate 2
-    python -m src.scripts.eval_inference compare path/to/baseline_summary.json path/to/candidate_summary.json
+    python -m src.eval_inference run
+    python -m src.eval_inference sharegpt-run --num-prompts 100
+    python -m src.eval_inference compare path/to/baseline_summary.json path/to/candidate_summary.json
+    python -m src.eval_inference graph path/to/baseline_summary.json path/to/candidate_summary.json
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import logging
 import math
 import random
 import statistics
@@ -26,10 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import logging
-
 logging.basicConfig(
-    level=logging.INFO,  # change to DEBUG if needed
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
@@ -46,11 +47,29 @@ DEFAULT_PROMPTS = [
     "Write two sentences about why benchmarking should separate TTFT and throughput.",
 ]
 DEFAULT_PERCENTILES = [50.0, 90.0, 95.0, 99.0]
+DEFAULT_SHAREGPT_DATASET = "Aeala/ShareGPT_Vicuna_unfiltered"
+DEFAULT_SHAREGPT_SPLIT = "train"
+DEFAULT_SHAREGPT_LENGTH_BUCKETS = 5
+DEFAULT_SHAREGPT_OVERSAMPLE_FACTOR = 8
+DEFAULT_SHAREGPT_MAX_ROWS = 5000
+DEFAULT_SHAREGPT_MIN_PROMPT_TOKENS = 32
 THROUGHPUT_METRIC_KEYS = {
     "request_throughput",
     "output_throughput",
     "total_token_throughput",
 }
+GRAPH_TTFT_METRICS = [
+    ("mean_ttft_ms", "Mean", "ms"),
+    ("median_ttft_ms", "Median", "ms"),
+    ("p90_ttft_ms", "P90", "ms"),
+    ("p95_ttft_ms", "P95", "ms"),
+    ("p99_ttft_ms", "P99", "ms"),
+]
+GRAPH_THROUGHPUT_METRICS = [
+    ("request_throughput", "Requests/s", "req/s"),
+    ("output_throughput", "Output tok/s", "tok/s"),
+    ("total_token_throughput", "Total tok/s", "tok/s"),
+]
 
 
 @dataclass
@@ -61,6 +80,16 @@ class PromptSpec:
     request_id: str | None = None
     source_index: int = 0
     source: str = "builtin"
+    prompt_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class ShareGPTPromptCandidate:
+    prompt: str
+    prompt_tokens: int
+    source_index: int
+    source_id: str
+    conversation_turns: int
 
 
 @dataclass
@@ -185,15 +214,21 @@ def _build_metric_stats(values: list[float], percentiles: list[float]) -> dict[s
         mean_value = statistics.fmean(values)
         std_value = statistics.pstdev(values) if len(values) > 1 else 0.0
         median_value = statistics.median(values)
+        min_value = min(values)
+        max_value = max(values)
     else:
         mean_value = 0.0
         std_value = 0.0
         median_value = 0.0
+        min_value = 0.0
+        max_value = 0.0
     return {
         "count": len(values),
         "mean": mean_value,
         "std": std_value,
         "median": median_value,
+        "min": min_value,
+        "max": max_value,
         "percentiles": {f"p{_format_percentile_label(p)}": _percentile(values, p) for p in percentiles},
     }
 
@@ -221,6 +256,7 @@ def _load_prompt_specs(prompt_file: Path | None) -> list[PromptSpec]:
                 raise ValueError(f"invalid JSON on line {index + 1} of {prompt_file}") from exc
             if not isinstance(payload, dict):
                 raise ValueError(f"line {index + 1} of {prompt_file} must be a JSON object")
+
             prompt = payload.get("prompt")
             if not isinstance(prompt, str) or not prompt:
                 raise ValueError(f"line {index + 1} of {prompt_file} must contain a non-empty 'prompt'")
@@ -244,6 +280,13 @@ def _load_prompt_specs(prompt_file: Path | None) -> list[PromptSpec]:
                     f"line {index + 1} of {prompt_file} has invalid 'request_id': {request_id!r}"
                 )
 
+            prompt_tokens = payload.get("prompt_tokens")
+            if prompt_tokens is not None:
+                if not isinstance(prompt_tokens, int) or prompt_tokens < 1:
+                    raise ValueError(
+                        f"line {index + 1} of {prompt_file} has invalid 'prompt_tokens': {prompt_tokens!r}"
+                    )
+
             specs.append(
                 PromptSpec(
                     prompt=prompt,
@@ -252,12 +295,33 @@ def _load_prompt_specs(prompt_file: Path | None) -> list[PromptSpec]:
                     request_id=request_id,
                     source_index=index,
                     source=str(prompt_file),
+                    prompt_tokens=prompt_tokens,
                 )
             )
 
     if not specs:
         raise ValueError(f"no prompts found in {prompt_file}")
     return specs
+
+
+def _write_prompt_specs_jsonl(path: Path, prompt_specs: Iterable[PromptSpec]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for spec in prompt_specs:
+            payload: dict[str, Any] = {
+                "prompt": spec.prompt,
+                "source": spec.source,
+                "source_index": spec.source_index,
+            }
+            if spec.max_tokens is not None:
+                payload["max_tokens"] = spec.max_tokens
+            if spec.ignore_eos is not None:
+                payload["ignore_eos"] = spec.ignore_eos
+            if spec.request_id is not None:
+                payload["request_id"] = spec.request_id
+            if spec.prompt_tokens is not None:
+                payload["prompt_tokens"] = spec.prompt_tokens
+            handle.write(json.dumps(payload, default=_json_default))
+            handle.write("\n")
 
 
 def _select_prompt_specs(
@@ -319,6 +383,7 @@ def _json_default(value: Any) -> Any:
 def _print_run_report(summary: dict[str, Any]) -> None:
     metrics = summary["metrics"]
     print("\n============ Inference Benchmark Result ============")
+    print("{:<40} {:<10}".format("Mode:", summary["mode"]))
     print("{:<40} {:<10}".format("Backend:", summary["config"]["kv_cache_manager"]))
     print("{:<40} {:<10}".format("Successful requests:", metrics["completed_requests"]))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", metrics["benchmark_duration_s"]))
@@ -358,6 +423,21 @@ def _print_metric_section(
     print("{:<40} {:<10.2f}".format(f"Median {label} (ms):", metrics[f"median_{name}_ms"]))
     for percentile_label, value in metrics[f"{name}_percentiles_ms"].items():
         print("{:<40} {:<10.2f}".format(f"{percentile_label.upper()} {label} (ms):", value))
+
+
+def _print_sharegpt_sample_report(path: Path, workload: dict[str, Any]) -> None:
+    stats = workload["sampled_prompt_token_stats"]
+    print("\n================ ShareGPT Prompt Sample ================")
+    print("{:<34} {}".format("Dataset:", workload["sharegpt_dataset"]))
+    print("{:<34} {}".format("Split:", workload["sharegpt_split"]))
+    print("{:<34} {}".format("Selected prompts:", workload["num_requests"]))
+    print("{:<34} {}".format("Length buckets:", workload["sharegpt_length_buckets"]))
+    print("{:<34} {}".format("Prompt token min:", int(stats["min"])))
+    print("{:<34} {:.2f}".format("Prompt token mean:", stats["mean"]))
+    print("{:<34} {:.2f}".format("Prompt token median:", stats["median"]))
+    print("{:<34} {}".format("Prompt token max:", int(stats["max"])))
+    print("{:<34} {}".format("Prompt file:", path))
+    print("========================================================\n")
 
 
 def _collect_metric_values(request_records: list[dict[str, Any]], key: str) -> list[float]:
@@ -438,6 +518,13 @@ def _make_output_paths(output_dir: Path, result_prefix: str) -> tuple[Path, Path
     return output_dir / f"{prefix}summary.json", output_dir / f"{prefix}requests.jsonl"
 
 
+def _make_artifact_path(output_dir: Path, result_prefix: str, suffix: str) -> Path:
+    prefix = result_prefix
+    if prefix and not prefix.endswith(("-", "_")):
+        prefix = f"{prefix}-"
+    return output_dir / f"{prefix}{suffix}"
+
+
 def _write_requests_jsonl(path: Path, request_records: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in request_records:
@@ -445,17 +532,288 @@ def _write_requests_jsonl(path: Path, request_records: Iterable[dict[str, Any]])
             handle.write("\n")
 
 
-def _run_benchmark(args: argparse.Namespace) -> int:
+def _first_non_empty_text(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def _normalize_prompt_text(text: str) -> str:
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").splitlines()]
+    return "\n".join(lines).strip()
+
+
+def _build_sharegpt_prompt(conversations: Any) -> tuple[str, int] | None:
+    if not isinstance(conversations, list):
+        return None
+
+    cleaned_turns: list[tuple[str, str]] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            continue
+        speaker = turn.get("from")
+        if speaker not in {"human", "gpt"}:
+            continue
+        content = _first_non_empty_text(turn.get("value"), turn.get("text"), turn.get("markdown"))
+        if content is None:
+            continue
+        content = _normalize_prompt_text(content)
+        if not content:
+            continue
+        if cleaned_turns and cleaned_turns[-1][0] == speaker:
+            merged = f"{cleaned_turns[-1][1]}\n\n{content}"
+            cleaned_turns[-1] = (speaker, merged)
+            continue
+        cleaned_turns.append((speaker, content))
+
+    while cleaned_turns and cleaned_turns[0][0] != "human":
+        cleaned_turns.pop(0)
+    while cleaned_turns and cleaned_turns[-1][0] != "human":
+        cleaned_turns.pop()
+
+    if not cleaned_turns:
+        return None
+
+    lines = []
+    for speaker, content in cleaned_turns:
+        role = "User" if speaker == "human" else "Assistant"
+        lines.append(f"{role}: {content}")
+    lines.append("Assistant:")
+    return "\n\n".join(lines), len(cleaned_turns)
+
+
+def _build_prompt_length_counter(checkpoint_dir: Path) -> Any:
+    checkpoint_dir = Path(checkpoint_dir)
+    tokenizer_json = checkpoint_dir / "tokenizer.json"
+    tokenizer_model = checkpoint_dir / "tokenizer.model"
+
+    if tokenizer_json.is_file():
+        try:
+            from tokenizers import Tokenizer as HFTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "prompt sampling requires the 'tokenizers' package when tokenizer.json is present"
+            ) from exc
+
+        processor = HFTokenizer.from_file(str(tokenizer_json))
+        return lambda text: len(processor.encode(text).ids)
+
+    if tokenizer_model.is_file():
+        try:
+            from sentencepiece import SentencePieceProcessor
+        except ImportError as exc:
+            raise RuntimeError(
+                "prompt sampling requires the 'sentencepiece' package when tokenizer.model is present"
+            ) from exc
+
+        processor = SentencePieceProcessor(model_file=str(tokenizer_model))
+        return lambda text: len(processor.encode(text))
+
+    raise RuntimeError(f"no tokenizer.json or tokenizer.model found in {checkpoint_dir}")
+
+
+def _encode_token_count(tokenizer: Any, text: str) -> int:
+    if callable(tokenizer) and not hasattr(tokenizer, "encode"):
+        return int(tokenizer(text))
+    encoded = tokenizer.encode(text)
+    if hasattr(encoded, "numel"):
+        return int(encoded.numel())
+    return len(encoded)
+
+
+def _resolve_sharegpt_max_prompt_tokens(args: argparse.Namespace) -> int:
+    max_prompt_tokens = args.sharegpt_max_prompt_tokens
+    budget_from_model_len = max(1, args.max_model_len - args.max_tokens)
+    if max_prompt_tokens is None:
+        max_prompt_tokens = budget_from_model_len
+    else:
+        max_prompt_tokens = min(max_prompt_tokens, budget_from_model_len)
+    if max_prompt_tokens < args.sharegpt_min_prompt_tokens:
+        raise ValueError(
+            "sharegpt prompt-token range is empty; "
+            f"min={args.sharegpt_min_prompt_tokens}, max={max_prompt_tokens}. "
+            "Increase --max-model-len, decrease --max-tokens, or lower --sharegpt-min-prompt-tokens."
+        )
+    return max_prompt_tokens
+
+
+def _collect_sharegpt_candidates(
+    args: argparse.Namespace,
+    tokenizer: Any,
+) -> tuple[list[ShareGPTPromptCandidate], int]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "sharegpt sampling requires the 'datasets' package. "
+            "Install it with: python -m pip install datasets==3.6.0"
+        ) from exc
+
+    max_prompt_tokens = _resolve_sharegpt_max_prompt_tokens(args)
+    dataset_stream = load_dataset(
+        args.sharegpt_dataset,
+        name=args.sharegpt_config,
+        split=args.sharegpt_split,
+        streaming=True,
+    )
+
+    target_candidates = max(
+        args.num_prompts,
+        args.num_prompts * args.sharegpt_oversample_factor,
+    )
+    candidates: list[ShareGPTPromptCandidate] = []
+    seen_prompts: set[str] = set()
+
+    scanned_rows = 0
+    for row_index, row in enumerate(dataset_stream):
+        scanned_rows = row_index + 1
+        if row_index >= args.sharegpt_max_rows:
+            break
+
+        prompt_data = _build_sharegpt_prompt(row.get("conversations"))
+        if prompt_data is None:
+            continue
+        prompt, conversation_turns = prompt_data
+        if prompt in seen_prompts:
+            continue
+
+        prompt_tokens = _encode_token_count(tokenizer, prompt)
+        if prompt_tokens < args.sharegpt_min_prompt_tokens or prompt_tokens > max_prompt_tokens:
+            continue
+
+        seen_prompts.add(prompt)
+        candidates.append(
+            ShareGPTPromptCandidate(
+                prompt=prompt,
+                prompt_tokens=prompt_tokens,
+                source_index=row_index,
+                source_id=str(row.get("id", row_index)),
+                conversation_turns=conversation_turns,
+            )
+        )
+        if len(candidates) >= target_candidates:
+            break
+
+    if len(candidates) < args.num_prompts:
+        raise ValueError(
+            "unable to collect enough ShareGPT prompts "
+            f"(needed {args.num_prompts}, found {len(candidates)} after scanning {min(args.sharegpt_max_rows, scanned_rows)} rows). "
+            "Increase --sharegpt-max-rows, widen the prompt-token range, or lower --num-prompts."
+        )
+
+    return candidates, max_prompt_tokens
+
+
+def _bucket_sharegpt_candidates(
+    candidates: list[ShareGPTPromptCandidate],
+    bucket_count: int,
+) -> list[list[ShareGPTPromptCandidate]]:
+    sorted_candidates = sorted(candidates, key=lambda item: item.prompt_tokens)
+    buckets: list[list[ShareGPTPromptCandidate]] = [[] for _ in range(bucket_count)]
+    for index, candidate in enumerate(sorted_candidates):
+        bucket_index = min(bucket_count - 1, index * bucket_count // len(sorted_candidates))
+        buckets[bucket_index].append(candidate)
+    return [bucket for bucket in buckets if bucket]
+
+
+def _select_sharegpt_candidates(
+    candidates: list[ShareGPTPromptCandidate],
+    target_count: int,
+    bucket_count: int,
+    seed: int | None,
+) -> list[ShareGPTPromptCandidate]:
+    rng = random.Random(seed)
+    buckets = _bucket_sharegpt_candidates(candidates, bucket_count)
+    if not buckets:
+        raise ValueError("no ShareGPT candidates available after filtering")
+
+    allocation = [0] * len(buckets)
+    remaining = target_count
+
+    while remaining > 0:
+        progressed = False
+        for bucket_index, bucket in enumerate(buckets):
+            if allocation[bucket_index] >= len(bucket):
+                continue
+            allocation[bucket_index] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+
+    selected: list[ShareGPTPromptCandidate] = []
+    for bucket, count in zip(buckets, allocation):
+        if count <= 0:
+            continue
+        selected.extend(rng.sample(bucket, count))
+
+    if len(selected) != target_count:
+        raise ValueError(
+            f"failed to allocate {target_count} ShareGPT prompts across {len(buckets)} buckets"
+        )
+
+    rng.shuffle(selected)
+    return selected
+
+
+def _sample_sharegpt_prompt_specs(
+    args: argparse.Namespace,
+    tokenizer: Any,
+) -> tuple[list[PromptSpec], dict[str, Any]]:
+    candidates, max_prompt_tokens = _collect_sharegpt_candidates(args, tokenizer)
+    selected = _select_sharegpt_candidates(
+        candidates=candidates,
+        target_count=args.num_prompts,
+        bucket_count=args.sharegpt_length_buckets,
+        seed=args.seed,
+    )
+
+    source_name = f"{args.sharegpt_dataset}:{args.sharegpt_split}"
+    prompt_specs = [
+        PromptSpec(
+            prompt=item.prompt,
+            source_index=item.source_index,
+            source=source_name,
+            prompt_tokens=item.prompt_tokens,
+        )
+        for item in selected
+    ]
+    prompt_lengths = [float(item.prompt_tokens) for item in selected]
+    workload = {
+        "prompt_source": "sharegpt",
+        "builtin_prompt_count": 0,
+        "sharegpt_dataset": args.sharegpt_dataset,
+        "sharegpt_config": args.sharegpt_config,
+        "sharegpt_split": args.sharegpt_split,
+        "sharegpt_min_prompt_tokens": args.sharegpt_min_prompt_tokens,
+        "sharegpt_max_prompt_tokens": max_prompt_tokens,
+        "sharegpt_length_buckets": args.sharegpt_length_buckets,
+        "sharegpt_oversample_factor": args.sharegpt_oversample_factor,
+        "sharegpt_max_rows": args.sharegpt_max_rows,
+        "sharegpt_candidates_considered": len(candidates),
+        "sampled_prompt_token_stats": _build_metric_stats(prompt_lengths, args.metric_percentiles),
+    }
+    return prompt_specs, workload
+
+
+def _run_benchmark_with_prompt_specs(
+    args: argparse.Namespace,
+    prompt_specs: list[PromptSpec],
+    *,
+    mode: str,
+    prompt_file_path: Path | None,
+    workload_overrides: dict[str, Any] | None = None,
+) -> int:
     _ensure_repo_imports()
     from src.config.vllm import VllmConfig
     from src.engine.async_engine import AsyncEngine
     from src.sampling_params import SamplingParams
 
-    prompt_specs = _select_prompt_specs(
-        _load_prompt_specs(args.prompt_file),
-        num_prompts=args.num_prompts,
-        seed=args.seed,
-    )
     submission_offsets = _build_submission_offsets(
         len(prompt_specs),
         arrival_mode=args.arrival_mode,
@@ -518,6 +876,7 @@ def _run_benchmark(args: argparse.Namespace) -> int:
             unfinished_per_step.append(unfinished_count)
             engine.step()
             total_engine_steps += 1
+
             observe_ts = time.perf_counter() - benchmark_start
             for trace in traces:
                 if trace.finish_ts is None:
@@ -543,9 +902,17 @@ def _run_benchmark(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path, requests_path = _make_output_paths(output_dir, args.result_prefix)
 
+    workload = {
+        "prompt_file": prompt_file_path,
+        "num_requests": len(prompt_specs),
+        "builtin_prompt_count": len(DEFAULT_PROMPTS) if prompt_file_path is None else 0,
+    }
+    if workload_overrides:
+        workload.update(workload_overrides)
+
     summary = {
         "created_at_utc": datetime.now(timezone.utc),
-        "mode": "run",
+        "mode": mode,
         "config": {
             "checkpoint_dir": args.checkpoint_dir,
             "kv_cache_manager": args.kv_cache_manager,
@@ -560,11 +927,7 @@ def _run_benchmark(args: argparse.Namespace) -> int:
             "seed": args.seed,
             "metric_percentiles": args.metric_percentiles,
         },
-        "workload": {
-            "prompt_file": args.prompt_file,
-            "num_requests": len(prompt_specs),
-            "builtin_prompt_count": len(DEFAULT_PROMPTS) if args.prompt_file is None else 0,
-        },
+        "workload": workload,
         "engine": {
             "engine_init_s": engine_init_s,
             "num_gpu_blocks": getattr(engine, "num_gpu_blocks", None),
@@ -574,6 +937,7 @@ def _run_benchmark(args: argparse.Namespace) -> int:
         "artifacts": {
             "summary_path": summary_path,
             "requests_path": requests_path,
+            "prompt_file": prompt_file_path,
         },
         "metrics": metrics,
     }
@@ -586,7 +950,54 @@ def _run_benchmark(args: argparse.Namespace) -> int:
     _print_run_report(summary)
     print(f"summary.json:  {summary_path}")
     print(f"requests.jsonl:{requests_path}")
+    if prompt_file_path is not None:
+        print(f"prompt_file:   {prompt_file_path}")
     return 0
+
+
+def _run_benchmark(args: argparse.Namespace) -> int:
+    prompt_specs = _select_prompt_specs(
+        _load_prompt_specs(args.prompt_file),
+        num_prompts=args.num_prompts,
+        seed=args.seed,
+    )
+    return _run_benchmark_with_prompt_specs(
+        args,
+        prompt_specs,
+        mode="run",
+        prompt_file_path=args.prompt_file,
+    )
+
+
+def _prepare_sharegpt_prompts(args: argparse.Namespace) -> int:
+    token_counter = _build_prompt_length_counter(args.checkpoint_dir)
+    prompt_specs, workload = _sample_sharegpt_prompt_specs(args, token_counter)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = _make_artifact_path(args.output_dir, args.result_prefix, "prompts.jsonl")
+    _write_prompt_specs_jsonl(prompt_path, prompt_specs)
+    workload["num_requests"] = len(prompt_specs)
+    _print_sharegpt_sample_report(prompt_path, workload)
+    return 0
+
+
+def _run_sharegpt_benchmark(args: argparse.Namespace) -> int:
+    token_counter = _build_prompt_length_counter(args.checkpoint_dir)
+    prompt_specs, workload = _sample_sharegpt_prompt_specs(args, token_counter)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = _make_artifact_path(args.output_dir, args.result_prefix, "prompts.jsonl")
+    _write_prompt_specs_jsonl(prompt_path, prompt_specs)
+    workload["num_requests"] = len(prompt_specs)
+    _print_sharegpt_sample_report(prompt_path, workload)
+
+    return _run_benchmark_with_prompt_specs(
+        args,
+        prompt_specs,
+        mode="sharegpt-run",
+        prompt_file_path=prompt_path,
+        workload_overrides=workload,
+    )
 
 
 def _load_summary(path: Path) -> dict[str, Any]:
@@ -656,8 +1067,7 @@ def _iter_compare_metrics(baseline_metrics: dict[str, Any], candidate_metrics: d
         "mean_unfinished_requests_per_step",
         "max_unfinished_requests_per_step",
     ]
-    available = [key for key in preferred_order if key in baseline_metrics and key in candidate_metrics]
-    return available
+    return [key for key in preferred_order if key in baseline_metrics and key in candidate_metrics]
 
 
 def _print_compare_report(
@@ -711,81 +1121,368 @@ def _compare_summaries(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Inference benchmark harness for mini-vLLM")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def _format_graph_value(value: float, unit: str) -> str:
+    return f"{value:.2f} {unit}".rstrip()
 
-    run_parser = subparsers.add_parser("run", help="Run an inference benchmark")
-    run_parser.add_argument(
+
+def _svg_rect(x: float, y: float, width: float, height: float, fill: str, stroke: str | None = None) -> str:
+    attrs = [f'x="{x:.2f}"', f'y="{y:.2f}"', f'width="{width:.2f}"', f'height="{height:.2f}"', f'fill="{fill}"']
+    if stroke is not None:
+        attrs.append(f'stroke="{stroke}"')
+    return f"<rect {' '.join(attrs)} />"
+
+
+def _svg_text(
+    x: float,
+    y: float,
+    text: str,
+    *,
+    font_size: int = 14,
+    fill: str = "#111827",
+    anchor: str = "start",
+    weight: str = "400",
+) -> str:
+    escaped = html.escape(text, quote=True)
+    return (
+        f'<text x="{x:.2f}" y="{y:.2f}" font-family="Arial, Helvetica, sans-serif" '
+        f'font-size="{font_size}" font-weight="{weight}" fill="{fill}" text-anchor="{anchor}">{escaped}</text>'
+    )
+
+
+def _render_metric_panel(
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    *,
+    title: str,
+    metric_specs: list[tuple[str, str, str]],
+    baseline_metrics: dict[str, Any],
+    candidate_metrics: dict[str, Any],
+    baseline_label: str,
+    candidate_label: str,
+) -> list[str]:
+    elements = [
+        _svg_rect(x, y, width, height, fill="#ffffff", stroke="#d1d5db"),
+        _svg_text(x + 24, y + 34, title, font_size=22, weight="700"),
+        _svg_text(x + 24, y + 58, "Each row is scaled to its own local max.", font_size=12, fill="#6b7280"),
+    ]
+
+    label_x = x + 24
+    series_label_x = x + 164
+    bar_x = x + 180
+    bar_width = width - 310
+    value_x = x + width - 20
+    row_top = y + 84
+    row_height = (height - 110) / max(1, len(metric_specs))
+    rail_color = "#e5e7eb"
+    baseline_color = "#2563eb"
+    candidate_color = "#ef4444"
+
+    for row_index, (metric_key, metric_label, row_unit) in enumerate(metric_specs):
+        base_value = float(baseline_metrics.get(metric_key, 0.0))
+        cand_value = float(candidate_metrics.get(metric_key, 0.0))
+        local_max = max(base_value, cand_value, 1e-9)
+        section_y = row_top + row_index * row_height
+
+        elements.append(_svg_text(label_x, section_y + 16, metric_label, font_size=15, weight="700"))
+
+        series = [
+            (baseline_label, base_value, baseline_color, section_y + 34),
+            (candidate_label, cand_value, candidate_color, section_y + 60),
+        ]
+        for series_label, value, color, bar_y in series:
+            elements.append(_svg_text(series_label_x, bar_y + 12, series_label, font_size=12, fill="#374151", anchor="end"))
+            elements.append(_svg_rect(bar_x, bar_y, bar_width, 14, fill=rail_color))
+            fill_width = 0.0 if value <= 0 else max(2.0, bar_width * (value / local_max))
+            elements.append(_svg_rect(bar_x, bar_y, fill_width, 14, fill=color))
+            elements.append(
+                _svg_text(
+                    value_x,
+                    bar_y + 12,
+                    _format_graph_value(value, row_unit),
+                    font_size=12,
+                    fill="#111827",
+                    anchor="end",
+                )
+            )
+
+    return elements
+
+
+def _render_comparison_graph_svg(
+    baseline_summary: dict[str, Any],
+    candidate_summary: dict[str, Any],
+    *,
+    baseline_label: str,
+    candidate_label: str,
+    baseline_path: Path,
+    candidate_path: Path,
+) -> str:
+    width = 1420
+    height = 780
+    margin = 36
+    panel_gap = 24
+    panel_width = (width - margin * 2 - panel_gap) / 2
+    panel_height = height - 180
+    panel_y = 136
+
+    baseline_metrics = baseline_summary["metrics"]
+    candidate_metrics = candidate_summary["metrics"]
+
+    elements = [
+        _svg_rect(0, 0, width, height, fill="#f8fafc"),
+        _svg_text(margin, 42, "mini-vLLM Benchmark Comparison", font_size=30, weight="700"),
+        _svg_text(
+            margin,
+            72,
+            f"Baseline: {baseline_path.name}    Candidate: {candidate_path.name}",
+            font_size=14,
+            fill="#475569",
+        ),
+        _svg_rect(margin, 92, 14, 14, fill="#2563eb"),
+        _svg_text(margin + 22, 104, baseline_label, font_size=13, fill="#334155"),
+        _svg_rect(margin + 130, 92, 14, 14, fill="#ef4444"),
+        _svg_text(margin + 152, 104, candidate_label, font_size=13, fill="#334155"),
+    ]
+
+    elements.extend(
+        _render_metric_panel(
+            margin,
+            panel_y,
+            panel_width,
+            panel_height,
+            title="TTFT Comparison",
+            metric_specs=GRAPH_TTFT_METRICS,
+            baseline_metrics=baseline_metrics,
+            candidate_metrics=candidate_metrics,
+            baseline_label=baseline_label,
+            candidate_label=candidate_label,
+        )
+    )
+    elements.extend(
+        _render_metric_panel(
+            margin + panel_width + panel_gap,
+            panel_y,
+            panel_width,
+            panel_height,
+            title="Throughput Comparison",
+            metric_specs=GRAPH_THROUGHPUT_METRICS,
+            baseline_metrics=baseline_metrics,
+            candidate_metrics=candidate_metrics,
+            baseline_label=baseline_label,
+            candidate_label=candidate_label,
+        )
+    )
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        + "".join(elements)
+        + "</svg>\n"
+    )
+
+
+def _default_graph_output_path(baseline_summary: Path, candidate_summary: Path) -> Path:
+    baseline_name = baseline_summary.stem.replace("-summary", "")
+    candidate_name = candidate_summary.stem.replace("-summary", "")
+    return baseline_summary.parent / f"{baseline_name}-vs-{candidate_name}-comparison.svg"
+
+
+def _graph_summaries(args: argparse.Namespace) -> int:
+    baseline_summary = _load_summary(args.baseline_summary)
+    candidate_summary = _load_summary(args.candidate_summary)
+
+    output_path = args.output or _default_graph_output_path(args.baseline_summary, args.candidate_summary)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    svg = _render_comparison_graph_svg(
+        baseline_summary,
+        candidate_summary,
+        baseline_label=args.baseline_label,
+        candidate_label=args.candidate_label,
+        baseline_path=args.baseline_summary,
+        candidate_path=args.candidate_summary,
+    )
+    output_path.write_text(svg, encoding="utf-8")
+    print(f"graph.svg:     {output_path}")
+    return 0
+
+
+def _add_run_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    default_num_prompts: int | None,
+    default_result_prefix: str,
+) -> None:
+    parser.add_argument(
         "--checkpoint-dir",
         type=Path,
         default=DEFAULT_CHECKPOINT_DIR,
         help=f"Path to the LitGPT checkpoint directory (default: {DEFAULT_CHECKPOINT_DIR})",
     )
-    run_parser.add_argument(
+    parser.add_argument(
         "--kv-cache-manager",
         choices=("standard", "paged"),
         default="standard",
         help="KV cache backend to benchmark",
     )
-    run_parser.add_argument("--max-num-seqs", type=_positive_int, default=2)
-    run_parser.add_argument("--max-num-batched-tokens", type=_positive_int, default=16384)
-    run_parser.add_argument("--max-model-len", type=_positive_int, default=8192)
-    run_parser.add_argument("--gpu-memory-utilization", type=_positive_float, default=0.9)
+    parser.add_argument("--max-num-seqs", type=_positive_int, default=5)
+    parser.add_argument("--max-num-batched-tokens", type=_positive_int, default=16384)
+    parser.add_argument("--max-model-len", type=_positive_int, default=8192)
+    parser.add_argument("--gpu-memory-utilization", type=_positive_float, default=0.9)
+    parser.add_argument(
+        "--num-prompts",
+        type=_positive_int,
+        default=default_num_prompts,
+        help="Prompt count to benchmark; with --seed, sample reproducibly",
+    )
+    parser.add_argument("--max-tokens", type=_positive_int, default=64)
+    ignore_group = parser.add_mutually_exclusive_group()
+    ignore_group.add_argument("--ignore-eos", dest="ignore_eos", action="store_true")
+    ignore_group.add_argument("--respect-eos", dest="ignore_eos", action="store_false")
+    parser.set_defaults(ignore_eos=True)
+    parser.add_argument("--arrival-mode", choices=("burst", "fixed-rate"), default="burst")
+    parser.add_argument(
+        "--request-rate",
+        type=_positive_float,
+        default=1.0,
+        help="Requests per second when --arrival-mode=fixed-rate",
+    )
+    parser.add_argument(
+        "--seed",
+        type=_non_negative_int,
+        default=None,
+        help="Seed used when sampling prompts",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=ROOT / "benchmark_results",
+        help="Directory for output artifacts",
+    )
+    parser.add_argument(
+        "--result-prefix",
+        type=str,
+        default=default_result_prefix,
+        help="Prefix prepended to artifact filenames",
+    )
+    parser.add_argument(
+        "--metric-percentiles",
+        type=_parse_metric_percentiles,
+        default=list(DEFAULT_PERCENTILES),
+        help="Comma-separated percentiles to report, e.g. 50,90,95,99",
+    )
+
+
+def _add_sharegpt_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--sharegpt-dataset",
+        type=str,
+        default=DEFAULT_SHAREGPT_DATASET,
+        help="Hugging Face dataset path used for ShareGPT sampling",
+    )
+    parser.add_argument(
+        "--sharegpt-config",
+        type=str,
+        default=None,
+        help="Optional dataset config name",
+    )
+    parser.add_argument(
+        "--sharegpt-split",
+        type=str,
+        default=DEFAULT_SHAREGPT_SPLIT,
+        help="Dataset split used for sampling",
+    )
+    parser.add_argument(
+        "--sharegpt-min-prompt-tokens",
+        type=_positive_int,
+        default=DEFAULT_SHAREGPT_MIN_PROMPT_TOKENS,
+        help="Minimum prompt-token length after formatting the conversation",
+    )
+    parser.add_argument(
+        "--sharegpt-max-prompt-tokens",
+        type=_positive_int,
+        default=None,
+        help="Optional upper bound on prompt tokens; capped by max_model_len - max_tokens",
+    )
+    parser.add_argument(
+        "--sharegpt-length-buckets",
+        type=_positive_int,
+        default=DEFAULT_SHAREGPT_LENGTH_BUCKETS,
+        help="Number of prompt-length buckets used for stratified sampling",
+    )
+    parser.add_argument(
+        "--sharegpt-oversample-factor",
+        type=_positive_int,
+        default=DEFAULT_SHAREGPT_OVERSAMPLE_FACTOR,
+        help="How many valid candidates to collect relative to the target sample count",
+    )
+    parser.add_argument(
+        "--sharegpt-max-rows",
+        type=_positive_int,
+        default=DEFAULT_SHAREGPT_MAX_ROWS,
+        help="Maximum streamed dataset rows to scan before giving up",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Inference benchmark harness for mini-vLLM")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Run an inference benchmark")
+    _add_run_arguments(
+        run_parser,
+        default_num_prompts=None,
+        default_result_prefix=f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+    )
     run_parser.add_argument(
         "--prompt-file",
         type=Path,
         default=None,
         help="Optional JSONL file with a 'prompt' field and optional per-row overrides",
     )
-    run_parser.add_argument(
-        "--num-prompts",
-        type=_positive_int,
-        default=None,
-        help="Limit the benchmark to this many prompts; with --seed, sample reproducibly",
-    )
-    run_parser.add_argument("--max-tokens", type=_positive_int, default=64)
-    ignore_group = run_parser.add_mutually_exclusive_group()
-    ignore_group.add_argument("--ignore-eos", dest="ignore_eos", action="store_true")
-    ignore_group.add_argument("--respect-eos", dest="ignore_eos", action="store_false")
-    run_parser.set_defaults(ignore_eos=True)
-    run_parser.add_argument("--arrival-mode", choices=("burst", "fixed-rate"), default="burst")
-    run_parser.add_argument(
-        "--request-rate",
-        type=_positive_float,
-        default=1.0,
-        help="Requests per second when --arrival-mode=fixed-rate",
-    )
-    run_parser.add_argument(
-        "--seed",
-        type=_non_negative_int,
-        default=None,
-        help="Seed used when sampling prompts with --num-prompts",
-    )
-    run_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=ROOT / "benchmark_results",
-        help="Directory for summary.json and requests.jsonl artifacts",
-    )
-    run_parser.add_argument(
-        "--result-prefix",
-        type=str,
-        default=f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-        help="Prefix prepended to artifact filenames",
-    )
-    run_parser.add_argument(
-        "--metric-percentiles",
-        type=_parse_metric_percentiles,
-        default=list(DEFAULT_PERCENTILES),
-        help="Comma-separated percentiles to report, e.g. 50,90,95,99",
-    )
     run_parser.set_defaults(func=_run_benchmark)
+
+    sharegpt_prepare_parser = subparsers.add_parser(
+        "sharegpt-prepare",
+        help="Sample a varied-length ShareGPT prompt file",
+    )
+    _add_run_arguments(
+        sharegpt_prepare_parser,
+        default_num_prompts=100,
+        default_result_prefix=f"sharegpt-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+    )
+    _add_sharegpt_arguments(sharegpt_prepare_parser)
+    sharegpt_prepare_parser.set_defaults(func=_prepare_sharegpt_prompts)
+
+    sharegpt_run_parser = subparsers.add_parser(
+        "sharegpt-run",
+        help="Sample ShareGPT prompts and run the benchmark end-to-end",
+    )
+    _add_run_arguments(
+        sharegpt_run_parser,
+        default_num_prompts=100,
+        default_result_prefix=f"sharegpt-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+    )
+    _add_sharegpt_arguments(sharegpt_run_parser)
+    sharegpt_run_parser.set_defaults(func=_run_sharegpt_benchmark)
 
     compare_parser = subparsers.add_parser("compare", help="Compare two benchmark summaries")
     compare_parser.add_argument("baseline_summary", type=Path)
     compare_parser.add_argument("candidate_summary", type=Path)
     compare_parser.set_defaults(func=_compare_summaries)
+
+    graph_parser = subparsers.add_parser(
+        "graph",
+        help="Render an SVG with side-by-side TTFT and throughput comparison panels",
+    )
+    graph_parser.add_argument("baseline_summary", type=Path)
+    graph_parser.add_argument("candidate_summary", type=Path)
+    graph_parser.add_argument("--output", type=Path, default=None)
+    graph_parser.add_argument("--baseline-label", type=str, default="Baseline")
+    graph_parser.add_argument("--candidate-label", type=str, default="Candidate")
+    graph_parser.set_defaults(func=_graph_summaries)
     return parser
 
 
@@ -793,15 +1490,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "run":
+    if args.command in {"run", "sharegpt-run", "sharegpt-prepare"}:
         if args.arrival_mode == "fixed-rate" and args.request_rate <= 0:
             parser.error("--request-rate must be > 0 when --arrival-mode=fixed-rate")
         if args.gpu_memory_utilization > 1.0:
             parser.error("--gpu-memory-utilization must be <= 1.0")
+
+    if args.command == "run":
         if args.prompt_file is not None and not args.prompt_file.exists():
             parser.error(f"prompt file not found: {args.prompt_file}")
 
-    if args.command == "compare":
+    if args.command in {"sharegpt-run", "sharegpt-prepare"}:
+        if args.num_prompts is None:
+            parser.error("--num-prompts is required for ShareGPT commands")
+        if args.sharegpt_length_buckets > args.num_prompts:
+            parser.error("--sharegpt-length-buckets must be <= --num-prompts")
+
+    if args.command in {"compare", "graph"}:
         missing = [path for path in (args.baseline_summary, args.candidate_summary) if not path.exists()]
         if missing:
             parser.error("missing summary file(s): " + ", ".join(str(path) for path in missing))

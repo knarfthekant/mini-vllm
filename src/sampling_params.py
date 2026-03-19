@@ -15,7 +15,7 @@ class SamplingParams:
     """
 
     temperature: float = 0.0
-    max_tokens: int = 512
+    max_tokens: int = 256
     ignore_eos: bool = False
 
     def __post_init__(self) -> None:
