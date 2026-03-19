@@ -22,7 +22,7 @@ BLOCK_SIZE: int = 16
 #
 # Keep this separate from the dense backend's BLOCK_SIZE so we can tune paged
 # kernel behavior independently without changing dense-cache behavior.
-PAGED_BLOCK_SIZE: int = 256
+PAGED_BLOCK_SIZE: int = 16
 BaseCacheManager = Literal["standard", "paged"]
 
 

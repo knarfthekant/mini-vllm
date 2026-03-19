@@ -111,13 +111,13 @@ From the saved summaries:
 
 | Metric | Dense (`standard`) | Paged (`paged`) | Direction |
 |---|---:|---:|---|
-| Benchmark duration | 15.75 s | 12.41 s | paged better |
-| Request throughput | 1.02 req/s | 1.29 req/s | paged better |
-| Output throughput | 65.01 tok/s | 82.49 tok/s | paged better |
-| Total token throughput | 1012.06 tok/s | 1329.70 tok/s | paged better |
-| Mean TTFT | 5996.18 ms | 5105.03 ms | paged better |
-| Median TTFT | 5423.53 ms | 3260.05 ms | paged better |
-| Mean TPOT | 50.85 ms | 63.92 ms | dense better |
+| Benchmark duration | 15.75 s | 11.80 s | paged better |
+| Request throughput | 1.02 req/s | 1.36 req/s | paged better |
+| Output throughput | 65.01 tok/s | 86.80 tok/s | paged better |
+| Total token throughput | 1012.06 tok/s | 1358.17 tok/s | paged better |
+| Mean TTFT | 5996.18 ms | 4591.34 ms | paged better |
+| Median TTFT | 5423.53 ms | 2526.07 ms | paged better |
+| Mean TPOT | 50.85 ms | 63.03 ms | dense better |
 
 In this sample, paged attention improved overall throughput and time-to-first-token, while dense attention still had better per-output-token latency. That tradeoff is exactly the kind of behavior this project is designed to expose and study.
 
