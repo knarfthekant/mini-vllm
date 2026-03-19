@@ -53,6 +53,18 @@ DEFAULT_SHAREGPT_LENGTH_BUCKETS = 5
 DEFAULT_SHAREGPT_OVERSAMPLE_FACTOR = 8
 DEFAULT_SHAREGPT_MAX_ROWS = 5000
 DEFAULT_SHAREGPT_MIN_PROMPT_TOKENS = 32
+STEP_TIMING_KEYS = [
+    "schedule_s",
+    "prefinished_apply_s",
+    "execute_model_s",
+    "runner_update_states_s",
+    "runner_prepare_inputs_s",
+    "runner_forward_s",
+    "runner_sample_s",
+    "scheduler_postprocess_s",
+    "finished_apply_s",
+    "step_total_s",
+]
 THROUGHPUT_METRIC_KEYS = {
     "request_throughput",
     "output_throughput",
@@ -192,6 +204,12 @@ def _positive_float(value: str) -> float:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be > 0")
     return parsed
+
+
+def _cap_prompt_token_ids(prompt_token_ids: list[int], prompt_token_cap: int | None) -> list[int]:
+    if prompt_token_cap is None or len(prompt_token_ids) <= prompt_token_cap:
+        return prompt_token_ids
+    return prompt_token_ids[:prompt_token_cap]
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -409,6 +427,7 @@ def _print_run_report(summary: dict[str, Any]) -> None:
             metrics["max_unfinished_requests_per_step"],
         )
     )
+    _print_step_timing_section(summary)
     print("==================================================\n")
 
 
@@ -423,6 +442,30 @@ def _print_metric_section(
     print("{:<40} {:<10.2f}".format(f"Median {label} (ms):", metrics[f"median_{name}_ms"]))
     for percentile_label, value in metrics[f"{name}_percentiles_ms"].items():
         print("{:<40} {:<10.2f}".format(f"{percentile_label.upper()} {label} (ms):", value))
+
+
+def _print_step_timing_section(summary: dict[str, Any]) -> None:
+    step_timing = summary.get("diagnostics", {}).get("step_timing")
+    if not step_timing:
+        return
+
+    print("{s:{c}^{n}}".format(s="Step Timing", n=50, c="-"))
+    print("{:<40} {:<10}".format("Timed engine steps:", step_timing["num_steps"]))
+    print("{:<40} {:<10}".format("Timing mode:", step_timing["timing_mode"]))
+
+    phase_specs = [
+        ("Mean schedule (ms):", "schedule_s"),
+        ("Mean input prep (ms):", "runner_prepare_inputs_s"),
+        ("Mean forward launch (ms):", "runner_forward_s"),
+        ("Mean sample sync (ms):", "runner_sample_s"),
+        ("Mean postprocess (ms):", "scheduler_postprocess_s"),
+        ("Mean full step (ms):", "step_total_s"),
+    ]
+    for label, key in phase_specs:
+        stats = step_timing["phases"].get(key)
+        if stats is None:
+            continue
+        print("{:<40} {:<10.2f}".format(label, stats["mean_ms"]))
 
 
 def _print_sharegpt_sample_report(path: Path, workload: dict[str, Any]) -> None:
@@ -509,6 +552,29 @@ def _flatten_metric_stats(name: str, stats: dict[str, Any]) -> dict[str, Any]:
     for percentile_label, value in stats["percentiles"].items():
         result[f"{percentile_label}_{name}_ms"] = value * 1000.0
     return result
+
+
+def _build_step_timing_stats(step_stats: list[dict[str, float]]) -> dict[str, Any] | None:
+    if not step_stats:
+        return None
+
+    phases: dict[str, Any] = {}
+    for key in STEP_TIMING_KEYS:
+        values = [float(stats[key]) for stats in step_stats if key in stats]
+        if not values:
+            continue
+        phases[key] = {
+            "mean_ms": statistics.fmean(values) * 1000.0,
+            "median_ms": statistics.median(values) * 1000.0,
+            "max_ms": max(values) * 1000.0,
+            "total_s": sum(values),
+        }
+
+    return {
+        "num_steps": len(step_stats),
+        "timing_mode": "host_wall_time",
+        "phases": phases,
+    }
 
 
 def _make_output_paths(output_dir: Path, result_prefix: str) -> tuple[Path, Path]:
@@ -631,6 +697,8 @@ def _resolve_sharegpt_max_prompt_tokens(args: argparse.Namespace) -> int:
         max_prompt_tokens = budget_from_model_len
     else:
         max_prompt_tokens = min(max_prompt_tokens, budget_from_model_len)
+    if args.prompt_token_cap is not None:
+        max_prompt_tokens = min(max_prompt_tokens, args.prompt_token_cap)
     if max_prompt_tokens < args.sharegpt_min_prompt_tokens:
         raise ValueError(
             "sharegpt prompt-token range is empty; "
@@ -837,6 +905,7 @@ def _run_benchmark_with_prompt_specs(
     next_submission_index = 0
     total_engine_steps = 0
     unfinished_per_step: list[int] = []
+    step_stats: list[dict[str, float]] = []
 
     benchmark_start = time.perf_counter()
     while next_submission_index < len(prompt_specs) or engine.has_unfinished_requests():
@@ -846,13 +915,19 @@ def _run_benchmark_with_prompt_specs(
             and elapsed_s >= submission_offsets[next_submission_index]
         ):
             spec = prompt_specs[next_submission_index]
+            prompt_input: str | list[int] = spec.prompt
+            if args.prompt_token_cap is not None:
+                prompt_input = _cap_prompt_token_ids(
+                    engine.tokenizer.encode(spec.prompt).tolist(),
+                    args.prompt_token_cap,
+                )
             sampling_params = SamplingParams(
                 temperature=0.0,
                 max_tokens=spec.max_tokens or args.max_tokens,
                 ignore_eos=args.ignore_eos if spec.ignore_eos is None else spec.ignore_eos,
             )
             request = engine.add_request(
-                prompt=spec.prompt,
+                prompt=prompt_input,
                 sampling_params=sampling_params,
                 request_id=spec.request_id,
             )
@@ -876,6 +951,8 @@ def _run_benchmark_with_prompt_specs(
             unfinished_per_step.append(unfinished_count)
             engine.step()
             total_engine_steps += 1
+            if args.profile_engine_step and engine.last_step_stats is not None:
+                step_stats.append(dict(engine.last_step_stats))
 
             observe_ts = time.perf_counter() - benchmark_start
             for trace in traces:
@@ -906,9 +983,15 @@ def _run_benchmark_with_prompt_specs(
         "prompt_file": prompt_file_path,
         "num_requests": len(prompt_specs),
         "builtin_prompt_count": len(DEFAULT_PROMPTS) if prompt_file_path is None else 0,
+        "prompt_token_cap": args.prompt_token_cap,
     }
     if workload_overrides:
         workload.update(workload_overrides)
+
+    diagnostics: dict[str, Any] = {}
+    step_timing = _build_step_timing_stats(step_stats)
+    if step_timing is not None:
+        diagnostics["step_timing"] = step_timing
 
     summary = {
         "created_at_utc": datetime.now(timezone.utc),
@@ -919,6 +1002,7 @@ def _run_benchmark_with_prompt_specs(
             "max_num_seqs": args.max_num_seqs,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "max_model_len": args.max_model_len,
+            "prompt_token_cap": args.prompt_token_cap,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_tokens": args.max_tokens,
             "ignore_eos": args.ignore_eos,
@@ -940,6 +1024,7 @@ def _run_benchmark_with_prompt_specs(
             "prompt_file": prompt_file_path,
         },
         "metrics": metrics,
+        "diagnostics": diagnostics,
     }
 
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -1372,6 +1457,17 @@ def _add_run_arguments(
         type=_parse_metric_percentiles,
         default=list(DEFAULT_PERCENTILES),
         help="Comma-separated percentiles to report, e.g. 50,90,95,99",
+    )
+    parser.add_argument(
+        "--prompt-token-cap",
+        type=_positive_int,
+        default=None,
+        help="Optional cap on prompt tokens applied at submission time, e.g. 512",
+    )
+    parser.add_argument(
+        "--profile-engine-step",
+        action="store_true",
+        help="Collect per-step host timing for scheduler, input prep, forward launch, and postprocess",
     )
 
 

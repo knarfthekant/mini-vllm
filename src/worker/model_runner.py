@@ -3,6 +3,7 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../litgpt"))
 
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -43,6 +44,7 @@ class ModelRunner:
         self._init_gpu_free_bytes = 0
         self._kv_cache_plan: KVCachePlan | None = None
         self._kv_cache_state: DenseKVCacheState | PagedKVCacheState | None = None
+        self.last_execute_model_stats: dict[str, float] | None = None
 
     @property
     def model(self) -> GPT:
@@ -241,13 +243,30 @@ class ModelRunner:
         if self._model is None:
             raise RuntimeError("Model is not loaded. Call load_model() first.")
 
+        self.last_execute_model_stats = None
+
+        update_start = time.perf_counter()
         self._update_states(scheduler_output)
+        after_update = time.perf_counter()
+
         model_inputs = self._prepare_inputs(scheduler_output)
+        after_prepare = time.perf_counter()
 
         logits = self._cache_manager.forward(self, model_inputs)
+        after_forward = time.perf_counter()
+
         batch_indices = torch.arange(logits.size(0), device=logits.device)
         last_logits = logits[batch_indices, model_inputs.last_token_indices, :]
         next_token_ids = last_logits.argmax(dim=-1).tolist()
+        after_sample = time.perf_counter()
+
+        self.last_execute_model_stats = {
+            "update_states_s": after_update - update_start,
+            "prepare_inputs_s": after_prepare - after_update,
+            "forward_s": after_forward - after_prepare,
+            "sample_s": after_sample - after_forward,
+            "execute_model_total_s": after_sample - update_start,
+        }
 
         return ModelRunnerOutput(sampled_token_ids=next_token_ids)
 

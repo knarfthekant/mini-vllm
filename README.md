@@ -103,8 +103,39 @@ That makes it easy to benchmark dense vs paged attention on the same style of wo
 
 ## Benchmark results
 
+
 The repository already includes a dense-vs-paged ShareGPT comparison for 16 prompts with mean prompt length around 950 tokens, ran on a single RTX5090 node with 32gb VRAM (approximately 15gb for KV Cache)
 
+##### 16 prompts with mediam length 210 tokens (burst mode)
+![Graph Summary](./benchmark_results/comparison-16-prompts-token-mean-210.svg)
+From the saved summaries:
+
+| Metric | Dense (`standard`) | Paged (`paged`) | Direction |
+|---|---:|---:|---|
+| Completed requests | 16.00 | 16.00 | flat |
+| Benchmark duration | 13.11 s | 8.15 s | paged better |
+| Request throughput | 1.22 req/s | 1.96 req/s | paged better |
+| Output throughput | 78.14 tok/s | 125.58 tok/s | paged better |
+| Total token throughput | 357.18 tok/s | 566.33 tok/s | paged better |
+| Mean TTFT | 4323.31 ms | 2380.89 ms | paged better |
+| Median TTFT | 3888.34 ms | 864.33 ms | paged better |
+| P90 TTFT | 7480.85 ms | 4909.84 ms | paged better |
+| P95 TTFT | 8321.17 ms | 4909.89 ms | paged better |
+| P99 TTFT | 10337.54 ms | 4909.92 ms | paged better |
+| Mean TPOT | 50.98 ms | 57.62 ms | dense better |
+| Median TPOT | 51.81 ms | 61.34 ms | dense better |
+| Mean ITL | 50.98 ms | 57.62 ms | dense better |
+| Median ITL | 51.52 ms | 52.25 ms | dense better |
+| Mean E2EL | 7535.20 ms | 6011.24 ms | paged better |
+| Median E2EL | 7152.39 ms | 4728.64 ms | paged better |
+| P90 E2EL | 10782.09 ms | 8150.24 ms | paged better |
+| P95 E2EL | 11361.99 ms | 8150.29 ms | paged better |
+| P99 E2EL | 12753.33 ms | 8150.33 ms | paged better |
+| Total engine steps | 256.00 | 128.00 | paged better |
+| Mean unfinished reqs/step | 8.50 | 11.00 | dense better |
+| Max unfinished reqs/step | 16.00 | 16.00 | flat |
+
+##### 16 prompts with mediam length 920 tokens (burst mode)
 ![Graph Summary](./benchmark_results/comparison-16-prompts-token-mean-950.svg)
 
 From the saved summaries:
@@ -120,6 +151,23 @@ From the saved summaries:
 | Mean TPOT | 50.85 ms | 63.03 ms | dense better |
 
 In this sample, paged attention improved overall throughput and time-to-first-token, while dense attention still had better per-output-token latency. That tradeoff is exactly the kind of behavior this project is designed to expose and study.
+
+## Limitations & improvements
+
+This project is intentionally small and not yet competitive with production serving stacks. The biggest current bottleneck is **prefill**.
+
+- **Limitation: prefill dominates end-to-end latency**
+  - Prefill runs full attention over the entire prompt and is a large fraction of total time (TTFT / E2EL), especially for longer prompts.
+  - With many concurrent requests, long-prefill requests can reduce batching efficiency for decode steps.
+- **Limitation: no chunked prefill**
+  - Prefill is currently done as a single monolithic pass per request (no chunked/paged prefill), which makes it harder to overlap work and keep the GPU consistently utilized.
+
+Planned improvements:
+
+- **Chunked prefill**: split long prompts into smaller chunks so the engine can interleave prompt ingestion with decode steps and improve tail latency under mixed workloads.
+- **Better prefill kernels / attention path**: use more optimized attention implementations for prompt ingestion (and/or reduce CPU-side overhead in metadata building).
+- **Prefix / prompt caching**: reuse KV for repeated system prompts or shared prefixes to reduce repeated prefill work.
+- **Smarter scheduling**: account for prefill cost explicitly (e.g., cap prefill tokens per step) to avoid one long prompt starving decode.
 
 ## Project structure
 

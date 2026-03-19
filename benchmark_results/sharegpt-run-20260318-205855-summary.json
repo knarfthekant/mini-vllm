@@ -1,0 +1,213 @@
+{
+  "created_at_utc": "2026-03-19T03:59:53.980480+00:00",
+  "mode": "sharegpt-run",
+  "config": {
+    "checkpoint_dir": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/checkpoints/meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "kv_cache_manager": "paged",
+    "max_num_seqs": 10,
+    "max_num_batched_tokens": 16384,
+    "max_model_len": 8192,
+    "gpu_memory_utilization": 0.9,
+    "max_tokens": 64,
+    "ignore_eos": true,
+    "arrival_mode": "burst",
+    "request_rate": 1.0,
+    "seed": null,
+    "metric_percentiles": [
+      50.0,
+      90.0,
+      95.0,
+      99.0
+    ]
+  },
+  "workload": {
+    "prompt_file": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/benchmark_results/sharegpt-run-20260318-205855-prompts.jsonl",
+    "num_requests": 16,
+    "builtin_prompt_count": 0,
+    "prompt_source": "sharegpt",
+    "sharegpt_dataset": "Aeala/ShareGPT_Vicuna_unfiltered",
+    "sharegpt_config": null,
+    "sharegpt_split": "train",
+    "sharegpt_min_prompt_tokens": 32,
+    "sharegpt_max_prompt_tokens": 8128,
+    "sharegpt_length_buckets": 5,
+    "sharegpt_oversample_factor": 8,
+    "sharegpt_max_rows": 5000,
+    "sharegpt_candidates_considered": 128,
+    "sampled_prompt_token_stats": {
+      "count": 16,
+      "mean": 983.3125,
+      "std": 581.6244190573071,
+      "median": 1062.0,
+      "min": 81.0,
+      "max": 1943.0,
+      "percentiles": {
+        "p50": 1062.0,
+        "p90": 1696.5,
+        "p95": 1789.25,
+        "p99": 1912.25
+      }
+    }
+  },
+  "engine": {
+    "engine_init_s": 10.03996428399114,
+    "num_gpu_blocks": 6198,
+    "max_seq_length": 8192,
+    "eos_token_id": 128009
+  },
+  "artifacts": {
+    "summary_path": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/benchmark_results/sharegpt-run-20260318-205855-summary.json",
+    "requests_path": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/benchmark_results/sharegpt-run-20260318-205855-requests.jsonl",
+    "prompt_file": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/benchmark_results/sharegpt-run-20260318-205855-prompts.jsonl"
+  },
+  "metrics": {
+    "benchmark_duration_s": 32.969271717011,
+    "completed_requests": 16,
+    "total_input_tokens": 15733,
+    "total_output_tokens": 1024,
+    "request_throughput": 0.48530037719166713,
+    "output_throughput": 31.059224140266696,
+    "total_token_throughput": 508.2611512875479,
+    "total_engine_steps": 128,
+    "mean_unfinished_requests_per_step": 11.0,
+    "max_unfinished_requests_per_step": 16,
+    "ttft_count": 16,
+    "mean_ttft_ms": 25662.198103938863,
+    "std_ttft_ms": 2811.2115371583745,
+    "median_ttft_ms": 23487.678974488517,
+    "ttft_percentiles_ms": {
+      "p50": 23487.678974488517,
+      "p90": 29292.010723496787,
+      "p95": 29292.61632123962,
+      "p99": 29292.97408265993
+    },
+    "p50_ttft_ms": 23487.678974488517,
+    "p90_ttft_ms": 29292.010723496787,
+    "p95_ttft_ms": 29292.61632123962,
+    "p99_ttft_ms": 29292.97408265993,
+    "ttl_count": 16,
+    "mean_ttl_ms": 30058.116963544308,
+    "std_ttl_ms": 2244.540203131173,
+    "median_ttl_ms": 28322.53974446212,
+    "ttl_percentiles_ms": {
+      "p50": 28322.53974446212,
+      "p90": 32956.359732488636,
+      "p95": 32956.96533023147,
+      "p99": 32957.32309165178
+    },
+    "p50_ttl_ms": 28322.53974446212,
+    "p90_ttl_ms": 32956.359732488636,
+    "p95_ttl_ms": 32956.96533023147,
+    "p99_ttl_ms": 32957.32309165178,
+    "e2el_count": 16,
+    "mean_e2el_ms": 30058.116963544308,
+    "std_e2el_ms": 2244.540203131173,
+    "median_e2el_ms": 28322.53974446212,
+    "e2el_percentiles_ms": {
+      "p50": 28322.53974446212,
+      "p90": 32956.359732488636,
+      "p95": 32956.96533023147,
+      "p99": 32957.32309165178
+    },
+    "p50_e2el_ms": 28322.53974446212,
+    "p90_e2el_ms": 32956.359732488636,
+    "p95_e2el_ms": 32956.96533023147,
+    "p99_e2el_ms": 32957.32309165178,
+    "itl_count": 1008,
+    "mean_itl_ms": 69.77648983500706,
+    "std_itl_ms": 15.250105149675537,
+    "median_itl_ms": 76.28729200223461,
+    "itl_percentiles_ms": {
+      "p50": 76.28729200223461,
+      "p90": 86.00327197927982,
+      "p95": 88.15742598380893,
+      "p99": 92.48478600056842
+    },
+    "p50_itl_ms": 76.28729200223461,
+    "p90_itl_ms": 86.00327197927982,
+    "p95_itl_ms": 88.15742598380893,
+    "p99_itl_ms": 92.48478600056842,
+    "tpot_count": 16,
+    "mean_tpot_ms": 69.77648983500706,
+    "std_tpot_ms": 8.994786819091761,
+    "median_tpot_ms": 76.74382174561273,
+    "tpot_percentiles_ms": {
+      "p50": 76.74382174561273,
+      "p90": 76.74382174561273,
+      "p95": 76.74382174561273,
+      "p99": 76.74382174561273
+    },
+    "p50_tpot_ms": 76.74382174561273,
+    "p90_tpot_ms": 76.74382174561273,
+    "p95_tpot_ms": 76.74382174561273,
+    "p99_tpot_ms": 76.74382174561273
+  },
+  "diagnostics": {
+    "step_timing": {
+      "num_steps": 128,
+      "timing_mode": "host_wall_time",
+      "phases": {
+        "schedule_s": {
+          "mean_ms": 0.04830257512367098,
+          "median_ms": 0.029606511816382408,
+          "max_ms": 1.0144409607164562,
+          "total_s": 0.006182729615829885
+        },
+        "prefinished_apply_s": {
+          "mean_ms": 0.0010124185791937634,
+          "median_ms": 0.0008865317795425653,
+          "max_ms": 0.009142968337982893,
+          "total_s": 0.00012958957813680172
+        },
+        "execute_model_s": {
+          "mean_ms": 257.3548521681914,
+          "median_ms": 73.48362449556589,
+          "max_ms": 23476.02471796563,
+          "total_s": 32.9414210775285
+        },
+        "runner_update_states_s": {
+          "mean_ms": 0.0009529280760034453,
+          "median_ms": 0.0007945054676383734,
+          "max_ms": 0.0149609986692667,
+          "total_s": 0.000121974793728441
+        },
+        "runner_prepare_inputs_s": {
+          "mean_ms": 1.5888563216321927,
+          "median_ms": 0.9955739951692522,
+          "max_ms": 88.25568400789052,
+          "total_s": 0.20337360916892067
+        },
+        "runner_forward_s": {
+          "mean_ms": 246.80483739075498,
+          "median_ms": 71.81083702016622,
+          "max_ms": 22528.466332994867,
+          "total_s": 31.591019186016638
+        },
+        "runner_sample_s": {
+          "mean_ms": 8.923767615215183,
+          "median_ms": 0.6854340026620775,
+          "max_ms": 859.1998680494726,
+          "total_s": 1.1422422547475435
+        },
+        "scheduler_postprocess_s": {
+          "mean_ms": 0.02004621865125955,
+          "median_ms": 0.017468002624809742,
+          "max_ms": 0.13646797742694616,
+          "total_s": 0.0025659159873612225
+        },
+        "finished_apply_s": {
+          "mean_ms": 0.0019089325178356376,
+          "median_ms": 0.00196098699234426,
+          "max_ms": 0.005958951078355312,
+          "total_s": 0.0002443433622829616
+        },
+        "step_total_s": {
+          "mean_ms": 257.4261223130634,
+          "median_ms": 73.56636648182757,
+          "max_ms": 23477.137577952817,
+          "total_s": 32.950543656072114
+        }
+      }
+    }
+  }
+}
