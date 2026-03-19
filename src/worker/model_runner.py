@@ -1,6 +1,6 @@
 import logging
-import sys
 import os
+import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../litgpt"))
 
 from pathlib import Path
@@ -9,46 +9,40 @@ from typing import Tuple
 import torch
 
 from litgpt.model import GPT  # type: ignore[import-untyped]
-from litgpt.config import Config  # type: ignore[import-untyped]
 
 from src.config.vllm import BLOCK_SIZE, VllmConfig
-from src.worker.model_input import ModelRunnerOutput, SchedulerOutput
+from src.engine.allocator import AllocatorEvent
+from src.worker.cache_manager import (
+    BaseCacheManager,
+    DenseKVCacheState,
+    KVCachePlan,
+    ModelExecutionInputs,
+    PagedKVCacheState,
+    build_cache_manager,
+)
+from src.worker.interface import SchedulerOutput, ModelRunnerOutput
 
 logger = logging.getLogger(__name__)
 
-
-class GPUModelRunner:
+class ModelRunner:
     """
     Manages loading and running the litgpt GPT model on a single GPU.
 
-    Wraps litgpt.model.GPT directly so the attention layer can later be
-    replaced with a paged-attention variant without touching the rest of the
-    engine stack.
-
-    Lifecycle
-    ─────────
-    1. load_model()                 – instantiate GPT and load weights
-    2. profile_run()                – warm-up forward for memory profiling
-    3. determine_available_memory() – compute bytes free for KV cache
-    4. compute_num_gpu_blocks()     – translate bytes → (num_blocks, max_seq_len)
-    5. initialize_kv_cache()        – call GPT.set_kv_cache() to allocate buffers
-
-    vLLM-style execution pipeline (per step)
-    ─────────────────────────────────────────
-    execute_model(scheduler_output)
-        ├─ _update_states   – (stub) future KV-cache slot bookkeeping
-        ├─ _prepare_inputs  – build (input_ids, positions, attn_metadata)
-        └─ GPT.forward      – forward pass → greedy sample
+    The runner owns the model lifecycle and delegates attention-specific KV
+    cache behavior to a pluggable Strategy. The standard backend allocates
+    dense per-sequence KV tensors; the paged backend allocates a shared block
+    pool for future paged-attention execution.
     """
 
     def __init__(self, vllm_config: VllmConfig) -> None:
+        logger.info("Initializing ModelRunner")
         self.vllm_config = vllm_config
+        self._cache_manager: BaseCacheManager = build_cache_manager(vllm_config.kv_cache_manager)
         self._model: GPT | None = None
         self._device: torch.device | None = None
-        # Free GPU bytes recorded immediately before model weights are loaded.
-        # Used by determine_available_memory() to measure the real memory delta
-        # caused by loading the model and running a warm-up forward pass.
-        self._init_gpu_free_bytes: int = 0
+        self._init_gpu_free_bytes = 0
+        self._kv_cache_plan: KVCachePlan | None = None
+        self._kv_cache_state: DenseKVCacheState | PagedKVCacheState | None = None
 
     @property
     def model(self) -> GPT:
@@ -62,41 +56,39 @@ class GPUModelRunner:
             raise RuntimeError("Device is not set. Call load_model() first.")
         return self._device
 
-    # ------------------------------------------------------------------
-    # Model loading
-    # ------------------------------------------------------------------
+    @property
+    def cache_manager_name(self) -> str:
+        return self._cache_manager.name
+
+    @property
+    def kv_cache_plan(self) -> KVCachePlan:
+        if self._kv_cache_plan is None:
+            raise RuntimeError("KV cache is not initialized. Call initialize_kv_cache() first.")
+        return self._kv_cache_plan
+
+    @property
+    def kv_cache_state(self) -> DenseKVCacheState | PagedKVCacheState | None:
+        return self._kv_cache_state
 
     def load_model(self) -> None:
         """
         Instantiate GPT from checkpoint config and load weights.
-
-        Loading strategy — minimal CPU RAM, correct dtype, single VRAM copy:
-
-          1. ``torch.load(map_location=device)`` streams each tensor directly
-             from disk → GPU through a small I/O buffer.  CPU RAM stays near
-             zero throughout (one tensor worth of read buffer at a time).
-             The previous mmap=True + map_location="cpu" approach faulted all
-             ~15 GiB of pages into RAM during load_state_dict, OOM-ing WSL2.
-
-          2. The checkpoint dtype (bfloat16) is read from the first tensor so
-             the meta model can be cast before assign.  Without this the meta
-             model defaults to float32, doubling VRAM usage (~15 GiB → ~30 GiB)
-             and leaving no room for the KV cache.
-
-          3. ``load_state_dict(assign=True)`` wires the already-GPU tensors
-             directly into model parameters — no second VRAM copy, and no
-             ``to_empty()`` pre-allocation is needed.
         """
+
         checkpoint_dir = Path(self.vllm_config.checkpoint_dir)
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if torch.cuda.is_available():
+            self._device = torch.device("cuda")
+        else:
+            logger.warning("No CUDA available, using CPU")
+            self._device = torch.device("cpu")
 
         # Snapshot free GPU memory before any model tensors are allocated.
-        # determine_available_memory() computes the delta against this value to
-        # find how much memory the model (+ warm-up activations) consumed.
-        if self._device.type == "cuda":
+        # used by determine_available_memory()
+        if self.device.type == "cuda":
             self._init_gpu_free_bytes = torch.cuda.mem_get_info()[0]
 
-        config = Config.from_file(checkpoint_dir / "model_config.yaml")
+        config = self.vllm_config.model_config
         checkpoint_path = checkpoint_dir / "lit_model.pth"
 
         # Step 1 — stream weights from disk directly onto the target device.
@@ -105,7 +97,7 @@ class GPUModelRunner:
         state_dict = torch.load(
             checkpoint_path,
             map_location=self.device,
-            weights_only=False,  # litgpt checkpoints may contain metadata objects
+            weights_only=False,
         )
         state_dict = state_dict.get("model", state_dict)
 
@@ -137,18 +129,12 @@ class GPUModelRunner:
         dtype = next(self.model.parameters()).dtype
         logger.info("Model loaded on %s in %s", self.device, dtype)
 
-    # ------------------------------------------------------------------
-    # KV-cache initialization  (mirrors vLLM v1 Worker interface)
-    # ------------------------------------------------------------------
 
     def profile_run(self) -> None:
         """
         Run a single dummy forward pass to warm up CUDA kernels and let all
         persistent allocations (model weights, CUDA graphs, etc.) settle before
         the memory snapshot in ``determine_available_memory`` is taken.
-
-        Uses batch_size=1 and BLOCK_SIZE tokens to keep the profile cheap
-        while still triggering all kernel paths.
         """
         dummy = torch.zeros((1, BLOCK_SIZE), dtype=torch.long, device=self.device)
         with torch.inference_mode():
@@ -159,8 +145,6 @@ class GPUModelRunner:
     def determine_available_memory(self) -> int:
         """
         Return the number of bytes available for KV cache allocation.
-
-        Follows the same approach as vLLM and nano-vllm:
 
           1. ``_init_gpu_free_bytes`` is recorded in ``load_model()`` *before*
              any model tensors are placed on the GPU.
@@ -206,166 +190,37 @@ class GPUModelRunner:
         )
         return available
 
+    def plan_kv_cache(self, available_bytes: int | None = None) -> KVCachePlan:
+        if available_bytes is None:
+            available_bytes = self.determine_available_memory()
+        return self._cache_manager.build_kv_cache_plan(self, available_bytes)
+
     def compute_num_gpu_blocks(self, available_bytes: int) -> Tuple[int, int]:
-        """
-        Translate available bytes into ``(num_gpu_blocks, max_seq_length)``.
+        plan = self.plan_kv_cache(available_bytes)
+        return plan.num_gpu_blocks, plan.max_seq_length
 
-        KV-cache memory footprint for litgpt's static buffers:
-
-            bytes = 2           (K + V)
-                  × n_layer
-                  × max_num_seqs
-                  × n_query_groups
-                  × max_seq_length
-                  × k_head_dim   (= rope_cache_length + head_size - rope_n_elem)
-                  × dtype_bytes
-
-        We solve for ``max_seq_length``, cap at the model's context window,
-        round down to ``BLOCK_SIZE``, and derive ``num_blocks`` from that.
-
-        The ``k_head_dim`` formula comes from litgpt's ``build_kv_cache``:
-        the stored K tensor includes the non-rotary residual dimensions, so
-        its last axis is slightly wider than ``head_size`` when
-        ``rotary_percentage < 1``.  When ``rotary_percentage == 1`` it equals
-        ``head_size``.  We use the actual rope_cache_length from the model's
-        registered buffer for accuracy.
-
-        Args:
-            available_bytes: Bytes available for KV-cache tensors.
-
-        Returns:
-            num_gpu_blocks: Number of BLOCK_SIZE-token blocks in the KV pool.
-            max_seq_length: Maximum per-sequence context the cache supports.
-        """
-        cfg = self.model.config
-        dtype_bytes: int = self.model.transformer.wte.weight.element_size() # type: ignore[attr-defined]
-        max_num_seqs: int = self.vllm_config.max_num_seqs
-
-        # rope_cache_length: number of rotary elements in K's last dimension.
-        rope_cache_length: int = self.model.rope_cache_length() # type: ignore[attr-defined]
-        # K last-dim width (see litgpt build_kv_cache)
-        assert cfg.head_size is not None, "Config.head_size must be set after __post_init__"
-        assert cfg.n_query_groups is not None, "Config.n_query_groups must be set after __post_init__"
-        rope_n_elem: int = int(cfg.rope_n_elem) # type: ignore[attr-defined]
-        k_head_dim: int = rope_cache_length + cfg.head_size - rope_n_elem
-
-        # Bytes consumed per token position across the whole batch:
-        #   2 sides (K/V) × layers × batch × query-groups × head-dim
-        bytes_per_token: int = (
-            2 * cfg.n_layer * max_num_seqs * cfg.n_query_groups
-            * k_head_dim * dtype_bytes
-        )
-
-        if bytes_per_token == 0:
-            raise RuntimeError("bytes_per_token is zero; model config may be invalid")
-
-        # Reserve a fraction of available bytes for activation memory during
-        # prefill (nano-vllm / vLLM style).  Using 100% for KV leaves no headroom
-        # and causes OOM or extreme slowness when allocating 50K+ token caches.
-        kv_cache_fraction: float = 0.9
-        bytes_for_kv: int = int(available_bytes * kv_cache_fraction)
-
-        # This is the maximum sequence length that can be supported by the available memory.
-        max_seq_length: int = bytes_for_kv // bytes_per_token
-
-        # Cap at user-configurable max (keeps init and prefill fast)
-        if self.vllm_config.max_model_len is not None:
-            max_seq_length = min(max_seq_length, self.vllm_config.max_model_len)
-
-        # Respect the model's own context window
-        max_seq_length = min(max_seq_length, cfg.block_size)
-        # Round down to BLOCK_SIZE boundary (≥ 1 block)
-        max_seq_length = max(BLOCK_SIZE, (max_seq_length // BLOCK_SIZE) * BLOCK_SIZE)
-
-        num_gpu_blocks: int = max_seq_length // BLOCK_SIZE
-
-        kv_cache_gib = (max_seq_length * bytes_per_token) / _GiB
-        logger.info(
-            "KV cache sizing: %d blocks × %d tokens/block = %d max_seq_length "
-            "(batch_size=%d, %.2f GiB)",
-            num_gpu_blocks,
-            BLOCK_SIZE,
-            max_seq_length,
-            max_num_seqs,
-            kv_cache_gib,
-        )
-        return num_gpu_blocks, max_seq_length
-
-    def initialize_kv_cache(self, num_gpu_blocks: int, max_seq_length: int) -> None:
-        """
-        TODO: Implement paged attention support in the future.
-        Allocate litgpt's static KV-cache buffers and bind them to the model.
-
-        Calls ``GPT.set_kv_cache(batch_size, max_seq_length)`` which
-        allocates one ``KVCache`` (two registered ``torch.Tensor`` buffers for
-        K and V) per transformer block.  Also updates ``model.max_seq_length``
-        so the RoPE cache is resized to match.
-
-        These buffers are not yet used during ``execute_model``; that requires
-        the scheduler to pass correct positions for decode steps.  The cache
-        will be populated automatically by litgpt's ``KVCache.forward`` once
-        ``input_pos`` is passed in the forward call.
-
-        Args:
-            num_gpu_blocks: Number of BLOCK_SIZE-token blocks.
-            max_seq_length: Maximum sequence length the cache supports.
-        """
-        max_num_seqs: int = self.vllm_config.max_num_seqs
-
-        # Resize RoPE buffers first; set_kv_cache then sees the correct size.
-        self.model.max_seq_length = max_seq_length
-
-        self.model.set_kv_cache(
-            batch_size=max_num_seqs,
-            max_seq_length=max_seq_length,
-            device=self.device,
-        )
-        logger.info(
-            "KV cache allocated: batch_size=%d, max_seq_length=%d (%d blocks)",
-            max_num_seqs,
-            max_seq_length,
-            num_gpu_blocks,
-        )
+    def initialize_kv_cache(self, plan: KVCachePlan | None = None) -> KVCachePlan:
+        if plan is None:
+            plan = self.plan_kv_cache()
+        self._kv_cache_state = self._cache_manager.initialize_kv_cache(self, plan)
+        self._kv_cache_plan = plan
+        return plan
 
     # ------------------------------------------------------------------
-    # vLLM-style execution pipeline
+    # Execution pipeline
     # ------------------------------------------------------------------
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
-        """
-        Stub: update request-to-KV-cache-slot mappings.
+        self._cache_manager.update_states(self, scheduler_output)
 
-        A full paged-attention implementation would consume block tables from
-        the scheduler output here.  Left empty until that layer is added.
-        """
+    def _prepare_inputs(self, scheduler_output: SchedulerOutput) -> ModelExecutionInputs:
+        return self._cache_manager.prepare_model_inputs(self, scheduler_output)
 
-    def _prepare_inputs(
-        self, scheduler_output: SchedulerOutput
-    ) -> Tuple[torch.Tensor, torch.Tensor, None]:
-        """
-        Build dense ``(B, T)`` input tensors from the scheduler output.
-
-        Variable-length sequences are right-padded with 0s to the length of
-        the longest sequence in the batch.  The ``attn_metadata`` slot is
-        ``None`` for now; it will carry paged-attention block tables later.
-
-        Returns:
-            input_ids:     LongTensor  (B, T)
-            positions:     LongTensor  (B, T)
-            attn_metadata: None  (stub)
-        """
-        seqs = scheduler_output.input_ids
-        pos_seqs = scheduler_output.positions
-
-        max_len = max(len(s) for s in seqs)
-
-        padded_ids = [s + [0] * (max_len - len(s)) for s in seqs]
-        padded_pos = [p + [0] * (max_len - len(p)) for p in pos_seqs]
-
-        input_ids = torch.tensor(padded_ids, dtype=torch.long, device=self.device)
-        positions = torch.tensor(padded_pos, dtype=torch.long, device=self.device)
-
-        return input_ids, positions, None  # attn_metadata is stub
+    def apply_allocator_events(self, events: list[AllocatorEvent]) -> None:
+        if not events:
+            return
+        with torch.inference_mode():
+            self._cache_manager.apply_allocator_events(self, events)
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
@@ -383,17 +238,21 @@ class GPUModelRunner:
         Returns:
             ModelRunnerOutput with one sampled next-token per sequence.
         """
-        if self.model is None:
+        if self._model is None:
             raise RuntimeError("Model is not loaded. Call load_model() first.")
 
         self._update_states(scheduler_output)
-        input_ids, positions, _attn_metadata = self._prepare_inputs(scheduler_output)
+        model_inputs = self._prepare_inputs(scheduler_output)
 
-        logits: torch.Tensor = self.model(input_ids, input_pos=positions)
-        # logits: (B, T, vocab_size) — take last token for each sequence
-        next_token_ids = logits[:, -1, :].argmax(dim=-1).tolist()
+        logits = self._cache_manager.forward(self, model_inputs)
+        batch_indices = torch.arange(logits.size(0), device=logits.device)
+        last_logits = logits[batch_indices, model_inputs.last_token_indices, :]
+        next_token_ids = last_logits.argmax(dim=-1).tolist()
 
         return ModelRunnerOutput(sampled_token_ids=next_token_ids)
+
+
+GPUModelRunner = ModelRunner
 
 
 # ---------------------------------------------------------------------------

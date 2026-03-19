@@ -15,6 +15,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing_extensions import Self
 
+from litgpt.attention_backends import (
+    BaseAttentionBackend,
+    DenseAttentionBackend,
+    PagedAttentionMetadata,
+)
 from litgpt.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
@@ -88,6 +93,7 @@ class GPT(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
+        attn_metadata: Optional[PagedAttentionMetadata] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -132,18 +138,21 @@ class GPT(nn.Module):
             if input_pos.dim() == 1:
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
-            if self.mask_cache is None:
+            if self.mask_cache is None and attn_metadata is None:
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = batched_index_select(self.mask_cache, 2, input_pos)
-            if mask.dim() > 4:
-                # the mask cache has a batch dim of 1 in addition to the one
-                # we get if input_pos has a batch dimension
-                mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-            if input_pos_maxp1 is not None:
-                # Shorten final dimension so it just covers all `input_pos` entries
-                if input_pos_maxp1 > self.max_seq_length:
-                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-                mask = mask[..., :input_pos_maxp1]
+            if self.mask_cache is not None:
+                mask = batched_index_select(self.mask_cache, 2, input_pos)
+                if mask.dim() > 4:
+                    # the mask cache has a batch dim of 1 in addition to the one
+                    # we get if input_pos has a batch dimension
+                    mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
+                if input_pos_maxp1 is not None:
+                    # Shorten final dimension so it just covers all `input_pos` entries
+                    if input_pos_maxp1 > self.max_seq_length:
+                        raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+                    mask = mask[..., :input_pos_maxp1]
+            else:
+                mask = None
         else:
             # unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
@@ -165,9 +174,10 @@ class GPT(nn.Module):
                     mask,
                     input_pos,
                     input_pos_maxp1,
+                    attn_metadata,
                 )
             else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1, attn_metadata)
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -251,6 +261,8 @@ class GPT(nn.Module):
 
         # initialize the kv cache for all blocks
         for block in self.transformer.h:
+            if hasattr(block.attn, "set_attention_backend"):
+                block.attn.set_attention_backend(DenseAttentionBackend())
             block.attn.kv_cache = block.attn.build_kv_cache(
                 batch_size,
                 max_seq_length,
@@ -268,6 +280,8 @@ class GPT(nn.Module):
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
+            if hasattr(block.attn, "set_attention_backend"):
+                block.attn.set_attention_backend(DenseAttentionBackend())
 
 
 class Block(nn.Module):
@@ -314,6 +328,7 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
+        attn_metadata: Optional[PagedAttentionMetadata] = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -337,7 +352,7 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
+        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, attn_metadata)
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -364,6 +379,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
         # disabled by default
         self.kv_cache: Optional[KVCache] = None
+        self.attention_backend: BaseAttentionBackend = DenseAttentionBackend()
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
@@ -389,6 +405,7 @@ class CausalSelfAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
+        attn_metadata: Optional[PagedAttentionMetadata] = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -462,32 +479,6 @@ class CausalSelfAttention(nn.Module):
         q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
         k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
 
-        # Apply kv-cache during inference.
-        if input_pos is not None:
-            if not isinstance(self.kv_cache, KVCache):
-                raise TypeError("You need to call `gpt.set_kv_cache()`")
-            k, v = self.kv_cache(input_pos, k, v)
-
-            if self.apply_sliding_window_attention:
-                actual_kv_len = k.size(2)
-                if mask is not None and mask.size(-1) != actual_kv_len:
-                    mask = mask[..., :actual_kv_len]
-
-            if input_pos_maxp1 is not None:
-                # Subselect along sequence dimension
-                k = k[..., :input_pos_maxp1, :]
-                v = v[..., :input_pos_maxp1, :]
-            # k, v: (B, nh_k, input_pos_maxp1, hs)
-            # If input_pos_maxp1 is None -> max_seq_length
-
-        # Grouped queries: balance the number of heads across all three matrices.
-        # NOTE: flash attention requires it in training mode.
-        # Multi-query: this step can be skipped since there is only 1 head, allowing us to use broadcasting.
-        if n_query_groups != n_head and (input_pos is None or n_query_groups != 1):
-            q_per_kv = n_head // n_query_groups
-            k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
-            v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
-
         if self.apply_sliding_window_attention:
             """
                   Global Window              Sliding window             Sliding window
@@ -512,10 +503,16 @@ class CausalSelfAttention(nn.Module):
                 sliding_window_mask = sliding_window_mask.view(1, 1, T, T)
                 mask = sliding_window_mask
 
-        # Efficient attention using Flash Attention CUDA kernels.
-        # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
-        # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        y = self.attention_backend.forward(
+            self,
+            q,
+            k,
+            v,
+            mask,
+            input_pos,
+            input_pos_maxp1,
+            attn_metadata,
+        )
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
@@ -583,6 +580,9 @@ class CausalSelfAttention(nn.Module):
             sliding_window_size=self.config.sliding_window_size if self.apply_sliding_window_attention else None,
         )
 
+    def set_attention_backend(self, backend: BaseAttentionBackend) -> None:
+        self.attention_backend = backend
+
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:
         """For compatibility with legacy checkpoints."""
 
@@ -629,6 +629,7 @@ class MultiheadLatentAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
+        attn_metadata: Optional[PagedAttentionMetadata] = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -663,6 +664,9 @@ class MultiheadLatentAttention(nn.Module):
 
         q = torch.cat((q_pass, q_roped), dim=-1)
         k = torch.cat((k_pass, k_roped), dim=-1)
+
+        if attn_metadata is not None:
+            raise RuntimeError("Paged attention is not implemented for MultiheadLatentAttention")
 
         # Apply kv-cache during inference.
         if input_pos is not None:

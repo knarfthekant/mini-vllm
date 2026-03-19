@@ -47,9 +47,9 @@ class Request:
 
     KV-cache stubs
     ──────────────
-    ``block_table`` and ``num_cached_tokens`` are present as stubs so the
-    scheduler and block manager can be wired up later without changing the
-    Request interface.
+    ``num_cached_tokens`` tracks how many tokens are already materialized in
+    KV cache for this request. Backend-specific placement metadata lives in the
+    allocator, not on the request object.
 
     Args:
         prompt_token_ids: Tokenised prompt (copied; not modified after init).
@@ -77,6 +77,7 @@ class Request:
         self.token_ids: List[int] = copy(prompt_token_ids)
         self.num_prompt_tokens: int = len(prompt_token_ids)
         self.num_tokens: int = len(prompt_token_ids)  # plain int, not property
+        self.num_cached_tokens: int = 0
         self.last_token: int = prompt_token_ids[-1]
 
         # Sampling parameters (flattened from SamplingParams for hot-path access)
@@ -84,18 +85,10 @@ class Request:
         self.max_tokens: int = sampling_params.max_tokens
         self.ignore_eos: bool = sampling_params.ignore_eos
 
-        # KV-cache stubs — populated by the block manager once paged attention
-        # is implemented.
-        self.num_cached_tokens: int = 0
-        self.block_table: List[int] = []
-
         self.status: RequestStatus = RequestStatus.WAITING
         self.stop_reason: Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # Token views (slice-based; no extra allocations until needed)
-    # ------------------------------------------------------------------
-
+    # Token views
     @property
     def prompt_token_ids(self) -> List[int]:
         return self.token_ids[: self.num_prompt_tokens]
@@ -108,36 +101,7 @@ class Request:
     def num_completion_tokens(self) -> int:
         return self.num_tokens - self.num_prompt_tokens
 
-    # ------------------------------------------------------------------
-    # Block helpers (stubs; values become meaningful with paged attention)
-    # ------------------------------------------------------------------
-
-    @property
-    def num_cached_blocks(self) -> int:
-        from src.config.vllm import BLOCK_SIZE
-        return self.num_cached_tokens // BLOCK_SIZE
-
-    @property
-    def num_blocks(self) -> int:
-        from src.config.vllm import BLOCK_SIZE
-        return (self.num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
-
-    @property
-    def last_block_num_tokens(self) -> int:
-        from src.config.vllm import BLOCK_SIZE
-        return self.num_tokens - (self.num_blocks - 1) * BLOCK_SIZE
-
-    def get_block_token_ids(self, block_idx: int) -> List[int]:
-        """Return the token IDs that belong to block ``block_idx``."""
-        from src.config.vllm import BLOCK_SIZE
-        assert 0 <= block_idx < self.num_blocks
-        start = block_idx * BLOCK_SIZE
-        return self.token_ids[start : start + BLOCK_SIZE]
-
-    # ------------------------------------------------------------------
     # Lifecycle helpers
-    # ------------------------------------------------------------------
-
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
 
@@ -146,11 +110,11 @@ class Request:
         Append one generated token and advance all counters.
 
         Automatically transitions to FINISHED_LENGTH_CAPPED when max_tokens
-        is reached.  Raises if the request is already finished.
+        is reached. Raises if the request is already finished.
         """
         if self.is_finished():
             raise RuntimeError(
-                f"Cannot append token to finished request {self.request_id!r} "
+                f"Cannot append token to finished request {self.request_id!r}"
                 f"(status={self.status.name})"
             )
 
@@ -161,10 +125,7 @@ class Request:
         if self.num_completion_tokens >= self.max_tokens:
             self.status = RequestStatus.FINISHED_LENGTH_CAPPED
 
-    # ------------------------------------------------------------------
     # Sequence-protocol helpers (mirrors nano-vllm for scheduler compat)
-    # ------------------------------------------------------------------
-
     def __len__(self) -> int:
         return self.num_tokens
 

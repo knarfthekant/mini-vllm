@@ -1,0 +1,120 @@
+{
+  "created_at_utc": "2026-03-18T20:53:06.832380+00:00",
+  "mode": "run",
+  "config": {
+    "checkpoint_dir": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/checkpoints/meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "kv_cache_manager": "paged",
+    "max_num_seqs": 10,
+    "max_num_batched_tokens": 16384,
+    "max_model_len": 8192,
+    "gpu_memory_utilization": 0.9,
+    "max_tokens": 64,
+    "ignore_eos": true,
+    "arrival_mode": "burst",
+    "request_rate": 1.0,
+    "seed": null,
+    "metric_percentiles": [
+      50.0,
+      90.0,
+      95.0,
+      99.0
+    ]
+  },
+  "workload": {
+    "prompt_file": null,
+    "num_requests": 8,
+    "builtin_prompt_count": 8
+  },
+  "engine": {
+    "engine_init_s": 11.647152477991767,
+    "num_gpu_blocks": 387,
+    "max_seq_length": 8192,
+    "eos_token_id": 128009
+  },
+  "artifacts": {
+    "summary_path": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/benchmark_results/run-20260318-135247-summary.json",
+    "requests_path": "/home/frank_shan/dev/python/gpu-testing/mini-vllm/benchmark_results/run-20260318-135247-requests.jsonl"
+  },
+  "metrics": {
+    "benchmark_duration_s": 3.494352471025195,
+    "completed_requests": 8,
+    "total_input_tokens": 107,
+    "total_output_tokens": 512,
+    "request_throughput": 2.289408428696064,
+    "output_throughput": 146.5221394365481,
+    "total_token_throughput": 177.14297717035794,
+    "total_engine_steps": 64,
+    "mean_unfinished_requests_per_step": 8.0,
+    "max_unfinished_requests_per_step": 8,
+    "ttft_count": 8,
+    "mean_ttft_ms": 367.21321547520347,
+    "std_ttft_ms": 0.15901991740435267,
+    "median_ttft_ms": 367.23765046917833,
+    "ttft_percentiles_ms": {
+      "p50": 367.23765046917833,
+      "p90": 367.39968256442813,
+      "p95": 367.42930727486964,
+      "p99": 367.4530070432229
+    },
+    "p50_ttft_ms": 367.23765046917833,
+    "p90_ttft_ms": 367.39968256442813,
+    "p95_ttft_ms": 367.42930727486964,
+    "p99_ttft_ms": 367.4530070432229,
+    "ttl_count": 8,
+    "mean_ttl_ms": 3493.6365125176962,
+    "std_ttl_ms": 0.15901991740435267,
+    "median_ttl_ms": 3493.660947511671,
+    "ttl_percentiles_ms": {
+      "p50": 3493.660947511671,
+      "p90": 3493.822979606921,
+      "p95": 3493.8526043173624,
+      "p99": 3493.8763040857157
+    },
+    "p50_ttl_ms": 3493.660947511671,
+    "p90_ttl_ms": 3493.822979606921,
+    "p95_ttl_ms": 3493.8526043173624,
+    "p99_ttl_ms": 3493.8763040857157,
+    "e2el_count": 8,
+    "mean_e2el_ms": 3493.6365125176962,
+    "std_e2el_ms": 0.15901991740435267,
+    "median_e2el_ms": 3493.660947511671,
+    "e2el_percentiles_ms": {
+      "p50": 3493.660947511671,
+      "p90": 3493.822979606921,
+      "p95": 3493.8526043173624,
+      "p99": 3493.8763040857157
+    },
+    "p50_e2el_ms": 3493.660947511671,
+    "p90_e2el_ms": 3493.822979606921,
+    "p95_e2el_ms": 3493.8526043173624,
+    "p99_e2el_ms": 3493.8763040857157,
+    "itl_count": 504,
+    "mean_itl_ms": 49.62576661972211,
+    "std_itl_ms": 9.356400196937408,
+    "median_itl_ms": 45.02324899658561,
+    "itl_percentiles_ms": {
+      "p50": 45.02324899658561,
+      "p90": 68.02141899242997,
+      "p95": 68.40834103059024,
+      "p99": 74.96059802360833
+    },
+    "p50_itl_ms": 45.02324899658561,
+    "p90_itl_ms": 68.02141899242997,
+    "p95_itl_ms": 68.40834103059024,
+    "p99_itl_ms": 74.96059802360833,
+    "tpot_count": 8,
+    "mean_tpot_ms": 49.62576661972211,
+    "std_tpot_ms": 0.0,
+    "median_tpot_ms": 49.62576661972211,
+    "tpot_percentiles_ms": {
+      "p50": 49.62576661972211,
+      "p90": 49.62576661972211,
+      "p95": 49.62576661972211,
+      "p99": 49.62576661972211
+    },
+    "p50_tpot_ms": 49.62576661972211,
+    "p90_tpot_ms": 49.62576661972211,
+    "p95_tpot_ms": 49.62576661972211,
+    "p99_tpot_ms": 49.62576661972211
+  }
+}
